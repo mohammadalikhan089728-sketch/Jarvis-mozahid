@@ -47,12 +47,16 @@ import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.NetworkCheck
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -65,6 +69,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.foundation.clickable
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -122,6 +127,7 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onSaveGeminiKeys: (String, String) -> Unit,
     onTestApiConnection: (String, String) -> Unit,
+    onSelectPreferredModel: (String) -> Unit,
     onSaveYouTubeCredentials: (apiKey: String, oauthJson: String) -> Unit,
     onConnectYouTube: () -> Unit,
     onManualOAuthCodeSubmit: (String) -> Unit,
@@ -149,6 +155,7 @@ fun SettingsScreen(
     var showKey1 by remember { mutableStateOf(false) }
     var showKey2 by remember { mutableStateOf(false) }
     var showYtKey by remember { mutableStateOf(false) }
+    var modelDropdownExpanded by remember { mutableStateOf(false) }
 
     var showManualCodeDialog by remember { mutableStateOf(false) }
     var manualOAuthCode by remember { mutableStateOf("") }
@@ -480,9 +487,119 @@ fun SettingsScreen(
                             onToggleVisible = { showKey2 = !showKey2 },
                             tag = "gemini_key_2_input"
                         )
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Preferred Model Selector Dropdown
+                        Text(
+                            text = "Preferred Model",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextSecondary
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(ObsidianSurfaceVariant)
+                                    .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                                    .clickable { modelDropdownExpanded = true }
+                                    .padding(horizontal = 14.dp, vertical = 14.dp)
+                                    .testTag("preferred_model_selector")
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Tune,
+                                        contentDescription = null,
+                                        tint = JarvisCyan,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = ModelRingConfig.labelForPreference(config.preferredModelId),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = TextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Icon(
+                                    imageVector = Icons.Rounded.ExpandMore,
+                                    contentDescription = "Choose preferred model",
+                                    tint = TextSecondary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+
+                            DropdownMenu(
+                                expanded = modelDropdownExpanded,
+                                onDismissRequest = { modelDropdownExpanded = false },
+                                modifier = Modifier
+                                    .background(ObsidianSurface)
+                                    .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Column {
+                                            Text(
+                                                text = "Auto-Rotate (Circular Fallback)",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = if (config.preferredModelId == ModelRingConfig.MODEL_MODE_AUTO) {
+                                                    JarvisCyan
+                                                } else {
+                                                    TextPrimary
+                                                }
+                                            )
+                                            Text(
+                                                text = "Cycles all 6 active models + Key 1/Key 2 + dynamic /v1beta/models",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextMuted
+                                            )
+                                        }
+                                    },
+                                    onClick = {
+                                        modelDropdownExpanded = false
+                                        onSelectPreferredModel(ModelRingConfig.MODEL_MODE_AUTO)
+                                    }
+                                )
+                                ModelRingConfig.MODEL_RING.forEach { slot ->
+                                    val selected = config.preferredModelId.equals(slot.modelId, ignoreCase = true)
+                                    DropdownMenuItem(
+                                        text = {
+                                            Column {
+                                                Text(
+                                                    text = slot.badgeLabel,
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = if (selected) JarvisCyan else TextPrimary
+                                                )
+                                                Text(
+                                                    text = if (slot.isLiveWebSocket) {
+                                                        "${slot.modelId} · Live Voice WebSocket"
+                                                    } else {
+                                                        slot.modelId
+                                                    },
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = TextMuted
+                                                )
+                                            }
+                                        },
+                                        onClick = {
+                                            modelDropdownExpanded = false
+                                            onSelectPreferredModel(slot.modelId)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(10.dp))
                         Text(
-                            text = "2-Level Ring: " + ModelRingConfig.MODEL_RING.joinToString(" → ") { it.badgeLabel },
+                            text = "Active Ring: " + ModelRingConfig.MODEL_RING.joinToString(" → ") { it.badgeLabel },
                             style = MaterialTheme.typography.labelSmall,
                             color = TextMuted
                         )

@@ -18,6 +18,7 @@ import javax.crypto.spec.GCMParameterSpec
 data class JarvisConfigSnapshot(
     val geminiKey1: String = "",
     val geminiKey2: String = "",
+    val preferredModelId: String = "auto",
     val youtubeApiKey: String = "",
     val youtubeOAuthJson: String = "",
     val youtubeChannelName: String = "",
@@ -126,6 +127,14 @@ class SecureVault(context: Context) {
         return list
     }
 
+    fun getPreferredModelId(): String =
+        prefs.getString(KEY_PREFERRED_MODEL, "auto")?.ifBlank { "auto" } ?: "auto"
+
+    fun setPreferredModelId(modelId: String) {
+        prefs.edit().putString(KEY_PREFERRED_MODEL, modelId.trim().ifEmpty { "auto" }).apply()
+        refresh()
+    }
+
     fun getYouTubeApiKey(): String = getSecret(KEY_YT_API)
     fun saveYouTubeApiKey(key: String) = putSecret(KEY_YT_API, key)
 
@@ -228,6 +237,7 @@ class SecureVault(context: Context) {
         return JarvisConfigSnapshot(
             geminiKey1 = getGeminiKey1(),
             geminiKey2 = getGeminiKey2(),
+            preferredModelId = getPreferredModelId(),
             youtubeApiKey = getYouTubeApiKey(),
             youtubeOAuthJson = getYouTubeOAuthJson(),
             youtubeChannelName = channelName,
@@ -255,6 +265,7 @@ class SecureVault(context: Context) {
 
         private const val KEY_GEMINI_1 = "enc_gemini_key_1"
         private const val KEY_GEMINI_2 = "enc_gemini_key_2"
+        private const val KEY_PREFERRED_MODEL = "preferred_model_id"
         private const val KEY_YT_API = "enc_youtube_api_key"
         private const val KEY_YT_OAUTH_JSON = "enc_youtube_oauth_json"
         private const val KEY_YT_ACCESS_TOKEN = "enc_youtube_access_token"

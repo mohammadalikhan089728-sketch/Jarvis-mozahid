@@ -8,6 +8,7 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.data.db.MemoryRepository
+import java.util.Calendar
 
 object JarvisAlarmScheduler {
 
@@ -36,6 +37,30 @@ object JarvisAlarmScheduler {
     ): Long {
         val safeDelayMs = delayMinutes.coerceAtLeast(1) * 60_000L
         val triggerAt = System.currentTimeMillis() + safeDelayMs
+        val cleanReason = reason.trim().ifEmpty { "your scheduled reminder" }
+        val alarmId = repository.saveAlarm(triggerAt, cleanReason)
+
+        scheduleSystemAlarm(context, alarmId.toInt(), triggerAt, cleanReason, CALL_TYPE_ALARM)
+        return triggerAt
+    }
+
+    suspend fun scheduleVoiceCallAlarmAtTime(
+        context: Context,
+        repository: MemoryRepository,
+        hour24: Int,
+        minute: Int,
+        reason: String
+    ): Long {
+        val cal = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, hour24.coerceIn(0, 23))
+            set(Calendar.MINUTE, minute.coerceIn(0, 59))
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis <= System.currentTimeMillis() + 5_000L) {
+                add(Calendar.DAY_OF_YEAR, 1)
+            }
+        }
+        val triggerAt = cal.timeInMillis
         val cleanReason = reason.trim().ifEmpty { "your scheduled reminder" }
         val alarmId = repository.saveAlarm(triggerAt, cleanReason)
 

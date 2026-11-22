@@ -231,15 +231,29 @@ class JarvisOrchestrator(
                 deviceActions.setDefaultTimer(seconds, label)
             }
             "set_jarvis_call_alarm" -> {
-                val delayMinutes = args.optInt("delay_minutes", 1).coerceAtLeast(1)
                 val reason = args.optString("reason", "your reminder")
-                JarvisAlarmScheduler.scheduleVoiceCallAlarm(
-                    context = context,
-                    repository = memoryRepository,
-                    delayMinutes = delayMinutes,
-                    reason = reason
-                )
-                "done: JARVIS voice-call alarm scheduled in $delayMinutes minute(s) for '$reason'"
+                if (args.has("hour") && !args.isNull("hour")) {
+                    val hour = args.optInt("hour", 6).coerceIn(0, 23)
+                    val minute = args.optInt("minute", 0).coerceIn(0, 59)
+                    JarvisAlarmScheduler.scheduleVoiceCallAlarmAtTime(
+                        context = context,
+                        repository = memoryRepository,
+                        hour24 = hour,
+                        minute = minute,
+                        reason = reason
+                    )
+                    val formatted = String.format("%02d:%02d", hour, minute)
+                    "done: JARVIS voice-call alarm scheduled for $formatted for '$reason'"
+                } else {
+                    val delayMinutes = args.optInt("delay_minutes", 1).coerceAtLeast(1)
+                    JarvisAlarmScheduler.scheduleVoiceCallAlarm(
+                        context = context,
+                        repository = memoryRepository,
+                        delayMinutes = delayMinutes,
+                        reason = reason
+                    )
+                    "done: JARVIS voice-call alarm scheduled in $delayMinutes minute(s) for '$reason'"
+                }
             }
             "save_memory" -> {
                 val note = args.optString("note", "")

@@ -14,6 +14,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 data class SlidingMessage(
@@ -35,23 +36,29 @@ data class ApiConnectionTestResult(
     val keyNumber: Int = 1
 )
 
+private data class DiscoveredKeyModels(
+    val bidiModels: List<String>,
+    val restModels: List<String>,
+    val fetchedAtMs: Long = System.currentTimeMillis()
+)
+
 /**
- * Production-grade Universal Fallback API Client & 2-Level Circular Fallback Engine:
- * - Uses ONLY valid Google Gemini API v1beta endpoints and real model IDs:
- *   1. gemini-3.1-flash-live-preview (Live WebSocket + live fallbacks)
- *   2. gemini-2.5-flash              (UI badge: 3.8-flash)
- *   3. gemini-2.5-flash-lite         (UI badge: 3.6-flash)
- *   4. gemini-2.0-flash              (UI badge: 3.5-flash-lite)
- *   5. gemini-2.0-flash-lite         (UI badge: decision-1)
- *   6. gemini-1.5-flash              (UI badge: 4-hydrogen)
- * - Smart Auth Header Handling:
- *   * Trims whitespace from saved keys.
- *   * `AIza...` -> `?key=...` AND `x-goog-api-key`
- *   * `AQ....` (OAuth / Cloud / Express) -> `Authorization: Bearer ...`, with 1 automatic retry via `?key=...` on 401/403.
- * - Zero Infinite Spinning:
- *   * Rotates to next model ONLY on 429 (Quota/Rate Limit), 503 (Overloaded), 404 (Model Not Found), or Live WS unavailable.
- *   * On 401/403 auth failure, jumps directly to API Key 2 (if configured) instead of spinning across 6 models on a dead key.
- *   * After 1 complete cycle across all configured keys, STOPS immediately and returns the real HTTP code + diagnostic message.
+ * Production-grade 2-Level Circular Fallback + Dynamic Model Discovery Engine:
+ * - Active Model Priority Ring (zero deprecated models):
+ *   1. gemini-3.1-flash-live-preview (Live Voice WebSocket BidiGenerateContent)
+ *   2. gemini-3.8-flash
+ *   3. gemini-3.6-flash
+ *   4. gemini-3.5-flash-lite
+ *   5. gemini-decision-1
+ *   6. gemini-4-hydrogen
+ * - Preferred Model Support:
+ *   * `auto` -> Circular Auto-Rotate across all 6 active models and Key 1 <-> Key 2 on 429/503/404.
+ *   * Specific model ID -> Locks onto user-selected model, while still auto-discovering active
+ *     `/v1beta/models` equivalents if that ID returns 404 for the provided API key.
+ * - Dynamic `/v1beta/models` Discovery:
+ *   * Whenever a model returns 404, fetches `/v1beta/models` using the active key's Smart Auth
+ *     (`AIza...` -> `?key=` + `x-goog-api-key`; `AQ.Ab8...` -> `Authorization: Bearer` with `?key=` retry)
+ *     and auto-maps to the closest active `generateContent` or `bidiGenerateContent` model.
  */
 class FallbackApiClient(
     private val vault: SecureVault,
@@ -70,6 +77,10 @@ class FallbackApiClient(
     @Volatile
     private var currentKeyListIndex = 0
 
+    @Volatile
+    private var lastResolvedModelId: String? = null
+
+    private val discoveredModelsCache = ConcurrentHashMap<Int, DiscoveredKeyModels>()
     private val slidingWindow = ArrayDeque<SlidingMessage>(MAX_SLIDING_WINDOW)
 
     private val _engineState = MutableStateFlow(buildEngineState())
@@ -82,6 +93,8 @@ class FallbackApiClient(
     fun resetRotationToStart() {
         currentModelIndex = 0
         currentKeyListIndex = 0
+        lastResolvedModelId = null
+        discoveredModelsCache.clear()
         liveClient.close()
         refreshState()
     }
@@ -89,11 +102,17 @@ class FallbackApiClient(
     private fun buildEngineState(): ActiveEngineState {
         val keys = vault.getAvailableGeminiKeys()
         val safeKeyNum = if (keys.isEmpty()) 1 else keys[currentKeyListIndex % keys.size].first
+        val preferred = vault.getPreferredModelId()
+        val isAuto = preferred == ModelRingConfig.MODEL_MODE_AUTO
+        val lockedSlot = if (isAuto) null else ModelRingConfig.findSlotById(preferred)
+        val activeSlot = lockedSlot ?: ModelRingConfig.MODEL_RING[currentModelIndex]
         return ActiveEngineState(
-            modelSlot = ModelRingConfig.MODEL_RING[currentModelIndex],
+            modelSlot = activeSlot,
             activeKeyNumber = safeKeyNum,
-            isLiveConnected = liveClient.isConnected(),
-            hasConfiguredKeys = keys.isNotEmpty()
+            isLiveConnected = activeSlot.isLiveWebSocket && liveClient.isConnected(),
+            hasConfiguredKeys = keys.isNotEmpty(),
+            isAutoRotate = isAuto,
+            resolvedModelId = lastResolvedModelId
         )
     }
 
@@ -130,6 +149,7 @@ class FallbackApiClient(
 
     /**
      * Quick "Hi" connection test used by the Settings "Test API Connection" button.
+     * Respects the user's Preferred Model and dynamically queries `/v1beta/models` if a model returns 404.
      */
     suspend fun testApiConnection(): ApiConnectionTestResult = withContext(Dispatchers.IO) {
         val keys = vault.getAvailableGeminiKeys()
@@ -140,33 +160,36 @@ class FallbackApiClient(
             )
         }
 
-        val restModels = ModelRingConfig.MODEL_RING.filter { !it.isLiveWebSocket }
+        val preferred = vault.getPreferredModelId()
+        val lockedSlot = if (preferred == ModelRingConfig.MODEL_MODE_AUTO) {
+            null
+        } else {
+            ModelRingConfig.findSlotById(preferred)
+        }
+
+        val restRing = if (lockedSlot != null && !lockedSlot.isLiveWebSocket) {
+            listOf(lockedSlot)
+        } else {
+            ModelRingConfig.MODEL_RING.filter { !it.isLiveWebSocket }
+        }
+
         var lastError = "Connection failed"
 
         for ((keyNum, rawKey) in keys) {
             val cleanKey = rawKey.trim()
-            for (slot in restModels) {
-                val contents = JSONArray().put(
-                    JSONObject()
-                        .put("role", "user")
-                        .put("parts", JSONArray().put(JSONObject().put("text", "Hi")))
-                )
-                val res = executeRestWithSmartAuth(
-                    credential = cleanKey,
-                    modelId = slot.modelId,
-                    contents = contents,
-                    includeTools = false,
-                    systemInstructionOverride = "Reply with only 'Online, Sir.'",
-                    jsonMimeType = false
-                )
+            val triedModelIds = mutableSetOf<String>()
+            var hitAuthError = false
 
+            // 1. Try configured active models first
+            for (slot in restRing) {
+                triedModelIds.add(slot.modelId)
+                val res = pingRestModel(cleanKey, slot.modelId)
                 if (res.error == null && res.text.isNotBlank()) {
                     val ringIdx = ModelRingConfig.MODEL_RING.indexOfFirst { it.modelId == slot.modelId }
-                    if (ringIdx >= 0) {
-                        currentModelIndex = ringIdx
-                        currentKeyListIndex = keys.indexOfFirst { it.first == keyNum }.coerceAtLeast(0)
-                        refreshState()
-                    }
+                    if (ringIdx >= 0) currentModelIndex = ringIdx
+                    currentKeyListIndex = keys.indexOfFirst { it.first == keyNum }.coerceAtLeast(0)
+                    lastResolvedModelId = slot.modelId
+                    refreshState()
                     return@withContext ApiConnectionTestResult(
                         success = true,
                         message = "Connected (Model: ${slot.modelId} · K$keyNum)",
@@ -176,13 +199,60 @@ class FallbackApiClient(
                 }
 
                 lastError = formatDiagnosticError(res.httpCode, res.error)
-                // If auth error (401/403), skip remaining models for this key and test next key
                 if (res.httpCode == 401 || res.httpCode == 403) {
+                    hitAuthError = true
                     break
                 }
-                // Only continue rotating models on 429, 503, 404
-                if (!res.shouldRotateModel) {
+
+                // On 404, immediately discover active models from /v1beta/models for this key
+                if (res.httpCode == 404) {
+                    val discovered = discoverActiveModelsForKey(cleanKey)
+                    val mapped = pickClosestRestModel(slot.modelId, discovered.restModels, triedModelIds)
+                    if (mapped != null) {
+                        triedModelIds.add(mapped)
+                        val mappedRes = pingRestModel(cleanKey, mapped)
+                        if (mappedRes.error == null && mappedRes.text.isNotBlank()) {
+                            currentKeyListIndex = keys.indexOfFirst { it.first == keyNum }.coerceAtLeast(0)
+                            lastResolvedModelId = mapped
+                            refreshState()
+                            return@withContext ApiConnectionTestResult(
+                                success = true,
+                                message = "Connected (Model: $mapped · K$keyNum)",
+                                modelId = mapped,
+                                keyNumber = keyNum
+                            )
+                        }
+                        lastError = formatDiagnosticError(mappedRes.httpCode, mappedRes.error)
+                        if (mappedRes.httpCode == 401 || mappedRes.httpCode == 403) {
+                            hitAuthError = true
+                            break
+                        }
+                    }
+                } else if (!res.shouldRotateModel) {
                     break
+                }
+            }
+
+            // 2. If all static slots returned 404/429 and key auth is valid, try remaining discovered models
+            if (!hitAuthError) {
+                val discovered = discoverActiveModelsForKey(cleanKey)
+                for (activeId in discovered.restModels) {
+                    if (!triedModelIds.add(activeId)) continue
+                    val res = pingRestModel(cleanKey, activeId)
+                    if (res.error == null && res.text.isNotBlank()) {
+                        currentKeyListIndex = keys.indexOfFirst { it.first == keyNum }.coerceAtLeast(0)
+                        lastResolvedModelId = activeId
+                        refreshState()
+                        return@withContext ApiConnectionTestResult(
+                            success = true,
+                            message = "Connected (Model: $activeId · K$keyNum)",
+                            modelId = activeId,
+                            keyNumber = keyNum
+                        )
+                    }
+                    lastError = formatDiagnosticError(res.httpCode, res.error)
+                    if (res.httpCode == 401 || res.httpCode == 403) break
+                    if (!res.shouldRotateModel) break
                 }
             }
         }
@@ -193,9 +263,25 @@ class FallbackApiClient(
         )
     }
 
+    private fun pingRestModel(cleanKey: String, modelId: String): RestCallResult {
+        val contents = JSONArray().put(
+            JSONObject()
+                .put("role", "user")
+                .put("parts", JSONArray().put(JSONObject().put("text", "Hi")))
+        )
+        return executeRestWithSmartAuth(
+            credential = cleanKey,
+            modelId = modelId,
+            contents = contents,
+            includeTools = false,
+            systemInstructionOverride = "Reply with only 'Online, Sir.'",
+            jsonMimeType = false
+        )
+    }
+
     /**
-     * Processes a standard text (or SpeechRecognizer transcribed) user turn with bounded single-cycle
-     * rotation across configured keys & valid models, returning exact HTTP diagnostics on failure.
+     * Processes a user turn with 2-Level Circular Fallback (or locked Preferred Model)
+     * plus dynamic `/v1beta/models` 404 auto-mapping.
      */
     suspend fun processUserTurn(
         userText: String,
@@ -213,8 +299,7 @@ class FallbackApiClient(
     )
 
     /**
-     * Multimodal audio fallback when Android SpeechRecognizer is unavailable on device:
-     * sends recorded 16kHz WAV audio directly to Gemini REST models (`gemini-2.5-flash` ring).
+     * Direct 16kHz WAV audio fallback when Android SpeechRecognizer is unavailable on device.
      */
     suspend fun processAudioTurn(
         audioWavBase64: String,
@@ -222,7 +307,7 @@ class FallbackApiClient(
         executeTool: suspend (name: String, args: JSONObject) -> String,
         onSubtitleUpdate: (String) -> Unit
     ): AssistantTurnOutput = processTurnInternal(
-        userText = "Listen to the user's spoken audio and respond or execute their requested tools immediately.",
+        userText = "Listen to Mozahid Sir's spoken voice command and reply or execute tools immediately.",
         audioWavBase64 = audioWavBase64,
         shouldContinue = shouldContinue,
         executeTool = executeTool,
@@ -257,12 +342,15 @@ class FallbackApiClient(
             appendSlidingMessage("user", userText)
         }
 
+        val preferred = vault.getPreferredModelId()
+        val isAutoRotate = preferred == ModelRingConfig.MODEL_MODE_AUTO
+        val lockedSlot = if (isAutoRotate) null else ModelRingConfig.findSlotById(preferred)
+
         val ringSize = ModelRingConfig.MODEL_RING.size
         val keysTried = mutableSetOf<Int>()
         var lastHttpCode = 0
         var lastErrorMsg = "Unable to reach Gemini API"
 
-        // Bounded cycle: visit each configured key at most once, and each model on that key at most once
         while (keysTried.size < keys.size && shouldContinue()) {
             val activeKeys = vault.getAvailableGeminiKeys()
             if (activeKeys.isEmpty()) break
@@ -272,27 +360,59 @@ class FallbackApiClient(
             val apiKey = keyPair.second.trim()
             if (!keysTried.add(keyNum)) break
 
-            var modelsTriedOnThisKey = 0
-            while (modelsTriedOnThisKey < ringSize && shouldContinue()) {
-                val slot = ModelRingConfig.MODEL_RING[currentModelIndex]
+            val triedRestIdsOnKey = mutableSetOf<String>()
+            val slotsToTryCount = if (lockedSlot != null) 1 else ringSize
+            var slotAttempts = 0
+            var keyAuthFailed = false
+
+            while (slotAttempts < slotsToTryCount && shouldContinue()) {
+                val slot = lockedSlot ?: ModelRingConfig.MODEL_RING[currentModelIndex]
                 _engineState.value = ActiveEngineState(
                     modelSlot = slot,
                     activeKeyNumber = keyNum,
                     isLiveConnected = slot.isLiveWebSocket && liveClient.isConnected(),
-                    hasConfiguredKeys = true
+                    hasConfiguredKeys = true,
+                    isAutoRotate = isAutoRotate,
+                    resolvedModelId = lastResolvedModelId
                 )
 
-                // Audio WAV fallback uses REST multimodal models directly (skip Live WebSocket slot)
+                // Audio WAV fallback uses REST multimodal models directly
                 if (slot.isLiveWebSocket && audioWavBase64 != null) {
-                    advanceToNextModel(activeKeys.size)
-                    modelsTriedOnThisKey++
-                    continue
+                    if (isAutoRotate) {
+                        advanceToNextModel(activeKeys.size)
+                        slotAttempts++
+                        continue
+                    } else {
+                        // Even when locked to Live model, route direct WAV fallback to active REST model
+                        val fallbackSlot = ModelRingConfig.MODEL_RING.first { !it.isLiveWebSocket }
+                        val restRes = runRestWithDynamicDiscovery(
+                            apiKey = apiKey,
+                            slot = fallbackSlot,
+                            keyNum = keyNum,
+                            topMemory = topMemory,
+                            audioWavBase64 = audioWavBase64,
+                            triedRestIdsOnKey = triedRestIdsOnKey,
+                            shouldContinue = shouldContinue,
+                            executeTool = executeTool,
+                            onSubtitleUpdate = onSubtitleUpdate
+                        )
+                        if (restRes.output != null) {
+                            appendSlidingMessage("model", restRes.output.spokenText)
+                            return@withContext restRes.output
+                        }
+                        lastHttpCode = restRes.httpCode
+                        lastErrorMsg = restRes.errorMessage ?: lastErrorMsg
+                        if (restRes.isAuthFailure) keyAuthFailed = true
+                        break
+                    }
                 }
 
                 if (slot.isLiveWebSocket) {
-                    val liveAttempt = runLiveLoop(
+                    val cachedBidi = discoveredModelsCache[apiKey.hashCode()]?.bidiModels.orEmpty()
+                    var liveAttempt = runLiveLoop(
                         apiKey = apiKey,
                         slot = slot,
+                        discoveredBidiModels = cachedBidi,
                         userText = userText,
                         topMemory = topMemory,
                         shouldContinue = shouldContinue,
@@ -300,26 +420,53 @@ class FallbackApiClient(
                         onLiveAudioChunk = onLiveAudioChunk,
                         onSubtitleUpdate = onSubtitleUpdate
                     )
+
+                    // On Live 404/unavailable, dynamically query /v1beta/models for bidiGenerateContent models
+                    if (liveAttempt.output == null && !liveAttempt.isAuthFailure && cachedBidi.isEmpty()) {
+                        val discovered = discoverActiveModelsForKey(apiKey)
+                        val newBidi = discovered.bidiModels.filterNot { it.equals(slot.modelId, ignoreCase = true) }
+                        if (newBidi.isNotEmpty() && shouldContinue()) {
+                            liveAttempt = runLiveLoop(
+                                apiKey = apiKey,
+                                slot = slot,
+                                discoveredBidiModels = newBidi,
+                                userText = userText,
+                                topMemory = topMemory,
+                                shouldContinue = shouldContinue,
+                                executeTool = executeTool,
+                                onLiveAudioChunk = onLiveAudioChunk,
+                                onSubtitleUpdate = onSubtitleUpdate
+                            )
+                        }
+                    }
+
                     if (liveAttempt.output != null) {
                         appendSlidingMessage("model", liveAttempt.output.spokenText)
                         return@withContext liveAttempt.output
                     }
+
                     lastHttpCode = liveAttempt.httpCode
                     lastErrorMsg = liveAttempt.errorMessage ?: lastErrorMsg
-
                     if (liveAttempt.isAuthFailure) {
-                        // Auth failed on this key -> jump immediately to next key
+                        keyAuthFailed = true
                         break
                     }
-                    advanceToNextModel(activeKeys.size)
-                    modelsTriedOnThisKey++
+
+                    if (isAutoRotate) {
+                        advanceToNextModel(activeKeys.size)
+                        slotAttempts++
+                    } else {
+                        // Locked to Live model, but Live WebSocket failed: fall back cleanly to discovered REST if needed
+                        break
+                    }
                 } else {
-                    val restAttempt = runRestLoop(
+                    val restAttempt = runRestWithDynamicDiscovery(
                         apiKey = apiKey,
                         slot = slot,
                         keyNum = keyNum,
                         topMemory = topMemory,
                         audioWavBase64 = audioWavBase64,
+                        triedRestIdsOnKey = triedRestIdsOnKey,
                         shouldContinue = shouldContinue,
                         executeTool = executeTool,
                         onSubtitleUpdate = onSubtitleUpdate
@@ -331,12 +478,11 @@ class FallbackApiClient(
                     lastHttpCode = restAttempt.httpCode
                     lastErrorMsg = restAttempt.errorMessage ?: lastErrorMsg
 
-                    if (restAttempt.httpCode == 401 || restAttempt.httpCode == 403) {
-                        // Auth error: do NOT spin through remaining models on the same invalid key
+                    if (restAttempt.isAuthFailure) {
+                        keyAuthFailed = true
                         break
                     }
                     if (!restAttempt.shouldRotateModel) {
-                        // Non-rotatable error (e.g. 400 malformed request or offline): stop immediately with real diagnostic
                         val diag = formatDiagnosticError(lastHttpCode, lastErrorMsg)
                         return@withContext AssistantTurnOutput(
                             spokenText = diag,
@@ -345,12 +491,47 @@ class FallbackApiClient(
                             isError = true
                         )
                     }
-                    advanceToNextModel(activeKeys.size)
-                    modelsTriedOnThisKey++
+                    if (isAutoRotate) {
+                        advanceToNextModel(activeKeys.size)
+                    }
+                    slotAttempts++
                 }
             }
 
-            // Finished all models (or hit auth error) on this key -> move to next API key if available
+            // If static slots returned 404/429 and auth succeeded, try any remaining dynamically discovered active REST models on this key
+            if (!keyAuthFailed && shouldContinue()) {
+                val discovered = discoverActiveModelsForKey(apiKey)
+                for (discoveredModelId in discovered.restModels) {
+                    if (!triedRestIdsOnKey.add(discoveredModelId)) continue
+                    val dynamicSlot = ModelSlot(
+                        modelId = discoveredModelId,
+                        badgeLabel = lockedSlot?.badgeLabel ?: discoveredModelId.removePrefix("gemini-"),
+                        isLiveWebSocket = false
+                    )
+                    val attempt = runRestLoop(
+                        apiKey = apiKey,
+                        slot = dynamicSlot,
+                        actualModelId = discoveredModelId,
+                        keyNum = keyNum,
+                        topMemory = topMemory,
+                        audioWavBase64 = audioWavBase64,
+                        shouldContinue = shouldContinue,
+                        executeTool = executeTool,
+                        onSubtitleUpdate = onSubtitleUpdate
+                    )
+                    if (attempt.output != null) {
+                        lastResolvedModelId = discoveredModelId
+                        _engineState.value = buildEngineState()
+                        appendSlidingMessage("model", attempt.output.spokenText)
+                        return@withContext attempt.output
+                    }
+                    lastHttpCode = attempt.httpCode
+                    lastErrorMsg = attempt.errorMessage ?: lastErrorMsg
+                    if (attempt.isAuthFailure || !attempt.shouldRotateModel) break
+                }
+            }
+
+            // Switch to Key 2 if available
             if (keysTried.size < activeKeys.size) {
                 advanceToNextKey(activeKeys.size)
             }
@@ -365,6 +546,188 @@ class FallbackApiClient(
         )
     }
 
+    private suspend fun runRestWithDynamicDiscovery(
+        apiKey: String,
+        slot: ModelSlot,
+        keyNum: Int,
+        topMemory: String?,
+        audioWavBase64: String?,
+        triedRestIdsOnKey: MutableSet<String>,
+        shouldContinue: () -> Boolean,
+        executeTool: suspend (name: String, args: JSONObject) -> String,
+        onSubtitleUpdate: (String) -> Unit
+    ): LoopOutcome {
+        triedRestIdsOnKey.add(slot.modelId)
+        val primary = runRestLoop(
+            apiKey = apiKey,
+            slot = slot,
+            actualModelId = slot.modelId,
+            keyNum = keyNum,
+            topMemory = topMemory,
+            audioWavBase64 = audioWavBase64,
+            shouldContinue = shouldContinue,
+            executeTool = executeTool,
+            onSubtitleUpdate = onSubtitleUpdate
+        )
+        if (primary.output != null || primary.isAuthFailure) {
+            if (primary.output != null) lastResolvedModelId = slot.modelId
+            return primary
+        }
+
+        // Dynamic Model Discovery on 404: fetch /v1beta/models and auto-map to closest active model
+        if (primary.httpCode == 404 && shouldContinue()) {
+            val discovered = discoverActiveModelsForKey(apiKey)
+            val mappedId = pickClosestRestModel(slot.modelId, discovered.restModels, triedRestIdsOnKey)
+            if (mappedId != null) {
+                triedRestIdsOnKey.add(mappedId)
+                val mappedAttempt = runRestLoop(
+                    apiKey = apiKey,
+                    slot = slot,
+                    actualModelId = mappedId,
+                    keyNum = keyNum,
+                    topMemory = topMemory,
+                    audioWavBase64 = audioWavBase64,
+                    shouldContinue = shouldContinue,
+                    executeTool = executeTool,
+                    onSubtitleUpdate = onSubtitleUpdate
+                )
+                if (mappedAttempt.output != null) {
+                    lastResolvedModelId = mappedId
+                    _engineState.value = buildEngineState()
+                }
+                return mappedAttempt
+            }
+        }
+
+        return primary
+    }
+
+    /**
+     * Dynamically fetches `/v1beta/models` for the given API key using Smart Auth
+     * (`AIza...` vs `AQ.Ab8...` Bearer) and caches active `generateContent` & `bidiGenerateContent` models.
+     */
+    private fun discoverActiveModelsForKey(apiKey: String): DiscoveredKeyModels {
+        val cacheKey = apiKey.hashCode()
+        val cached = discoveredModelsCache[cacheKey]
+        if (cached != null && System.currentTimeMillis() - cached.fetchedAtMs < DISCOVERY_CACHE_TTL_MS) {
+            return cached
+        }
+
+        val clean = apiKey.trim()
+        val rawBody = fetchModelsJsonWithSmartAuth(clean) ?: return DiscoveredKeyModels(emptyList(), emptyList())
+
+        val bidi = mutableListOf<String>()
+        val rest = mutableListOf<String>()
+        try {
+            val modelsArr = JSONObject(rawBody).optJSONArray("models") ?: JSONArray()
+            for (i in 0 until modelsArr.length()) {
+                val obj = modelsArr.optJSONObject(i) ?: continue
+                val rawName = obj.optString("name", "").removePrefix("models/").trim()
+                if (rawName.isEmpty()) continue
+                val lower = rawName.lowercase()
+                if (!lower.startsWith("gemini-")) continue
+                // Exclude deprecated legacy 1.0/1.5/2.0 families and non-chat utility models
+                if (lower.contains("-1.0") || lower.contains("-1.5") || lower.contains("-2.0")) continue
+                if (lower.contains("embedding") || lower.contains("imagen") ||
+                    lower.contains("veo") || lower.contains("aqa") || lower.contains("tts")
+                ) continue
+
+                val methodsArr = obj.optJSONArray("supportedGenerationMethods") ?: JSONArray()
+                var supportsGenerate = false
+                var supportsBidi = false
+                for (m in 0 until methodsArr.length()) {
+                    when (methodsArr.optString(m)) {
+                        "generateContent" -> supportsGenerate = true
+                        "bidiGenerateContent" -> supportsBidi = true
+                    }
+                }
+                if (supportsBidi) bidi.add(rawName)
+                if (supportsGenerate && !lower.contains("live")) rest.add(rawName)
+            }
+        } catch (_: Exception) {
+            // Ignore malformed response
+        }
+
+        val sortedBidi = bidi.distinct().sortedByDescending { scoreDiscoveredModel(it) }
+        val sortedRest = rest.distinct().sortedByDescending { scoreDiscoveredModel(it) }
+        val result = DiscoveredKeyModels(bidiModels = sortedBidi, restModels = sortedRest)
+        if (sortedBidi.isNotEmpty() || sortedRest.isNotEmpty()) {
+            discoveredModelsCache[cacheKey] = result
+        }
+        return result
+    }
+
+    private fun fetchModelsJsonWithSmartAuth(credential: String): String? {
+        val clean = credential.trim()
+        if (clean.startsWith("AIza")) {
+            return fetchModelsJsonOnce(clean, useBearer = false).second
+        }
+        val (code, body) = fetchModelsJsonOnce(clean, useBearer = true)
+        if (body != null) return body
+        if (code == 401 || code == 403) {
+            return fetchModelsJsonOnce(clean, useBearer = false).second
+        }
+        return null
+    }
+
+    private fun fetchModelsJsonOnce(credential: String, useBearer: Boolean): Pair<Int, String?> {
+        val baseUrl = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100"
+        val reqBuilder = if (useBearer) {
+            val bare = credential.removePrefix("Bearer ").trim()
+            Request.Builder()
+                .url(baseUrl)
+                .addHeader("Authorization", "Bearer $bare")
+                .get()
+        } else {
+            val encoded = URLEncoder.encode(credential, "UTF-8")
+            Request.Builder()
+                .url("$baseUrl&key=$encoded")
+                .addHeader("x-goog-api-key", credential)
+                .get()
+        }
+        return try {
+            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (resp.isSuccessful) resp.code to resp.body?.string() else resp.code to null
+            }
+        } catch (_: Exception) {
+            0 to null
+        }
+    }
+
+    private fun pickClosestRestModel(
+        requestedModelId: String,
+        discoveredRestModels: List<String>,
+        alreadyTried: Set<String>
+    ): String? {
+        val available = discoveredRestModels.filterNot { it in alreadyTried }
+        if (available.isEmpty()) return null
+        val reqLower = requestedModelId.lowercase()
+        return available.maxByOrNull { candidate ->
+            val candLower = candidate.lowercase()
+            var score = scoreDiscoveredModel(candidate)
+            if (reqLower.contains("lite") && candLower.contains("lite")) score += 40
+            if (reqLower.contains("flash") && candLower.contains("flash")) score += 25
+            if (reqLower.contains("pro") && candLower.contains("pro")) score += 25
+            score
+        }
+    }
+
+    private fun scoreDiscoveredModel(modelId: String): Int {
+        val lower = modelId.lowercase()
+        var score = 0
+        when {
+            lower.contains("gemini-4") -> score += 140
+            lower.contains("gemini-3") -> score += 120
+            lower.contains("gemini-2.5") -> score += 100
+            else -> score += 50
+        }
+        if (lower.contains("flash")) score += 30
+        if (lower.contains("lite")) score -= 5
+        if (lower.contains("latest")) score += 10
+        if (lower.contains("preview") || lower.contains("exp")) score -= 8
+        return score
+    }
+
     private data class LoopOutcome(
         val output: AssistantTurnOutput? = null,
         val httpCode: Int = 0,
@@ -376,6 +739,7 @@ class FallbackApiClient(
     private suspend fun runLiveLoop(
         apiKey: String,
         slot: ModelSlot,
+        discoveredBidiModels: List<String>,
         userText: String,
         topMemory: String?,
         shouldContinue: () -> Boolean,
@@ -386,6 +750,7 @@ class FallbackApiClient(
         var result = liveClient.sendSingleTurn(
             apiKey = apiKey,
             primaryModelId = slot.modelId,
+            discoveredBidiModels = discoveredBidiModels,
             userText = userText,
             memorySnippet = topMemory,
             onAudioBase64 = onLiveAudioChunk,
@@ -445,6 +810,9 @@ class FallbackApiClient(
             )
         }
 
+        if (result.activeModelId.isNotBlank()) {
+            lastResolvedModelId = result.activeModelId
+        }
         return LoopOutcome(
             output = AssistantTurnOutput(
                 spokenText = finalText,
@@ -457,6 +825,7 @@ class FallbackApiClient(
     private suspend fun runRestLoop(
         apiKey: String,
         slot: ModelSlot,
+        actualModelId: String,
         keyNum: Int,
         topMemory: String?,
         audioWavBase64: String?,
@@ -497,7 +866,7 @@ class FallbackApiClient(
         while (step <= MAX_TOOL_STEPS && shouldContinue()) {
             val response = executeRestWithSmartAuth(
                 credential = apiKey,
-                modelId = slot.modelId,
+                modelId = actualModelId,
                 contents = contents,
                 includeTools = true
             )
@@ -567,7 +936,7 @@ class FallbackApiClient(
             return LoopOutcome(
                 httpCode = response.httpCode,
                 shouldRotateModel = true,
-                errorMessage = "Empty response from ${slot.modelId}"
+                errorMessage = "Empty response from $actualModelId"
             )
         }
 
@@ -595,7 +964,11 @@ class FallbackApiClient(
         val restModels = ModelRingConfig.MODEL_RING.filter { !it.isLiveWebSocket }
         for ((_, rawKey) in keys) {
             val cleanKey = rawKey.trim()
+            val tried = mutableSetOf<String>()
+            var authFailed = false
+
             for (slot in restModels) {
+                tried.add(slot.modelId)
                 val contents = JSONArray().put(
                     JSONObject()
                         .put("role", "user")
@@ -612,8 +985,58 @@ class FallbackApiClient(
                 if (res.error == null && res.text.isNotBlank()) {
                     return@withContext res.text.trim()
                 }
-                if (res.httpCode == 401 || res.httpCode == 403) break
-                if (!res.shouldRotateModel) break
+                if (res.httpCode == 401 || res.httpCode == 403) {
+                    authFailed = true
+                    break
+                }
+                if (res.httpCode == 404) {
+                    val discovered = discoverActiveModelsForKey(cleanKey)
+                    val mapped = pickClosestRestModel(slot.modelId, discovered.restModels, tried)
+                    if (mapped != null) {
+                        tried.add(mapped)
+                        val mappedRes = executeRestWithSmartAuth(
+                            credential = cleanKey,
+                            modelId = mapped,
+                            contents = contents,
+                            includeTools = false,
+                            systemInstructionOverride = systemInstruction,
+                            jsonMimeType = expectJson
+                        )
+                        if (mappedRes.error == null && mappedRes.text.isNotBlank()) {
+                            return@withContext mappedRes.text.trim()
+                        }
+                        if (mappedRes.httpCode == 401 || mappedRes.httpCode == 403) {
+                            authFailed = true
+                            break
+                        }
+                    }
+                } else if (!res.shouldRotateModel) {
+                    break
+                }
+            }
+
+            if (!authFailed) {
+                val discovered = discoverActiveModelsForKey(cleanKey)
+                for (activeId in discovered.restModels) {
+                    if (!tried.add(activeId)) continue
+                    val contents = JSONArray().put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put("parts", JSONArray().put(JSONObject().put("text", prompt)))
+                    )
+                    val res = executeRestWithSmartAuth(
+                        credential = cleanKey,
+                        modelId = activeId,
+                        contents = contents,
+                        includeTools = false,
+                        systemInstructionOverride = systemInstruction,
+                        jsonMimeType = expectJson
+                    )
+                    if (res.error == null && res.text.isNotBlank()) {
+                        return@withContext res.text.trim()
+                    }
+                    if (res.httpCode == 401 || res.httpCode == 403 || !res.shouldRotateModel) break
+                }
             }
         }
         null
@@ -627,13 +1050,6 @@ class FallbackApiClient(
         val error: String? = null
     )
 
-    /**
-     * Smart Auth Header Handling:
-     * - Trims saved API keys.
-     * - `AIza...` -> query param `?key=$apiKey` AND header `x-goog-api-key: $apiKey`.
-     * - `AQ....` (or non-AIza Bearer token) -> header `Authorization: Bearer $apiKey`;
-     *   if HTTP 401 or 403 occurs, automatically retries ONCE with `?key=$apiKey` + `x-goog-api-key`.
-     */
     private fun executeRestWithSmartAuth(
         credential: String,
         modelId: String,
@@ -666,7 +1082,6 @@ class FallbackApiClient(
         )
         if (bearerRes.error == null) return bearerRes
 
-        // Retry once with ?key= if AQ./Bearer token got 401/403
         if (bearerRes.httpCode == 401 || bearerRes.httpCode == 403) {
             return executeRestSingleAttempt(
                 credential = clean,
@@ -690,7 +1105,8 @@ class FallbackApiClient(
         systemInstructionOverride: String?,
         jsonMimeType: Boolean
     ): RestCallResult {
-        val baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent"
+        val cleanModel = modelId.removePrefix("models/").trim()
+        val baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent"
         val bodyJson = JSONObject()
             .put(
                 "system_instruction",
@@ -736,7 +1152,6 @@ class FallbackApiClient(
                 val raw = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
                     val shortMsg = extractShortApiError(raw, resp.message)
-                    // Rotate ONLY on 429 (Quota/Rate Limit), 503 (Overloaded), or 404 (Model Not Found)
                     val shouldRotate = resp.code == 429 ||
                         resp.code == 503 ||
                         resp.code == 404 ||
@@ -822,6 +1237,7 @@ class FallbackApiClient(
     companion object {
         private const val MAX_SLIDING_WINDOW = 4
         private const val MAX_TOOL_STEPS = 20
+        private const val DISCOVERY_CACHE_TTL_MS = 10 * 60 * 1000L
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }

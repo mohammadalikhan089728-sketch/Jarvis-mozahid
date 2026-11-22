@@ -16,8 +16,10 @@ data class LiveTurnResult(
     val transcript: String,
     val receivedNativeAudio: Boolean,
     val toolCalls: List<ToolCallRequest>,
+    val activeModelId: String = "",
     val httpCode: Int = 0,
     val isAuthFailure: Boolean = false,
+    val isNotFound: Boolean = false,
     val isRetryableError: Boolean = false,
     val errorMessage: String? = null
 )
@@ -30,11 +32,11 @@ data class ToolCallRequest(
 
 /**
  * Multimodal Gemini Live WebSocket client (BidiGenerateContent):
- * - Tries `models/gemini-3.1-flash-live-preview` with fast fallback to
- *   `models/gemini-2.5-flash-native-audio-preview-09-2025` and `models/gemini-2.0-flash-exp`.
- * - Smart Auth: `AIza...` -> `?key=...` + `x-goog-api-key`; `AQ.` / Bearer -> `Authorization: Bearer ...`
- *   with automatic one-time retry using `?key=...` on 401/403.
- * - Zero-Token-Wastage: single-turn `clientContent` payloads and `resumeHandle` reconnects.
+ * - Connects to `models/gemini-3.1-flash-live-preview` (and any dynamically discovered
+ *   `bidiGenerateContent` models from `/v1beta/models` if 404 occurs).
+ * - Smart Auth: `AIza...` -> `?key=...` + `x-goog-api-key`; `AQ.Ab8...` / Bearer ->
+ *   `Authorization: Bearer ...` with automatic one-time retry via `?key=...` on 401/403.
+ * - Zero-Token-Wastage: single-turn `clientContent` payloads and `sessionResumption` handles.
  */
 class GeminiLiveWebSocketClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -71,6 +73,7 @@ class GeminiLiveWebSocketClient(
     suspend fun sendSingleTurn(
         apiKey: String,
         primaryModelId: String,
+        discoveredBidiModels: List<String> = emptyList(),
         userText: String,
         memorySnippet: String?,
         onAudioBase64: (String) -> Unit,
@@ -80,11 +83,16 @@ class GeminiLiveWebSocketClient(
         onAudioChunk = onAudioBase64
         onTranscriptDelta = onTextDelta
 
-        if (webSocket == null || !isSetupComplete || activeApiKey != cleanKey) {
-            val candidates = (listOf(primaryModelId) + ModelRingConfig.LIVE_FALLBACK_MODELS).distinct()
+        val candidates = (listOf(primaryModelId) + discoveredBidiModels)
+            .map { it.removePrefix("models/").trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        if (webSocket == null || !isSetupComplete || activeApiKey != cleanKey || activeLiveModel !in candidates) {
             var lastCode = 0
             var lastMsg: String? = null
             var lastAuthFail = false
+            var lastNotFound = false
             var connected = false
 
             for (liveModel in candidates) {
@@ -97,8 +105,8 @@ class GeminiLiveWebSocketClient(
                 lastCode = attempt.httpCode
                 lastMsg = attempt.errorMessage
                 lastAuthFail = attempt.isAuthFailure
+                lastNotFound = attempt.isNotFound
                 if (attempt.isAuthFailure) {
-                    // Don't waste time trying other live models with the same rejected credential
                     break
                 }
             }
@@ -110,6 +118,7 @@ class GeminiLiveWebSocketClient(
                     toolCalls = emptyList(),
                     httpCode = lastCode,
                     isAuthFailure = lastAuthFail,
+                    isNotFound = lastNotFound,
                     isRetryableError = true,
                     errorMessage = lastMsg ?: "Live WebSocket unavailable"
                 )
@@ -163,6 +172,7 @@ class GeminiLiveWebSocketClient(
                 transcript = turnTranscript.toString().trim(),
                 receivedNativeAudio = receivedAudioInTurn,
                 toolCalls = pendingToolCalls.toList(),
+                activeModelId = activeLiveModel,
                 isRetryableError = turnTranscript.isEmpty() && pendingToolCalls.isEmpty(),
                 errorMessage = "Live response timeout"
             )
@@ -213,6 +223,7 @@ class GeminiLiveWebSocketClient(
             transcript = turnTranscript.toString().trim(),
             receivedNativeAudio = receivedAudioInTurn,
             toolCalls = pendingToolCalls.toList(),
+            activeModelId = activeLiveModel,
             isRetryableError = false
         )
     }
@@ -221,6 +232,7 @@ class GeminiLiveWebSocketClient(
         val connected: Boolean,
         val httpCode: Int = 0,
         val isAuthFailure: Boolean = false,
+        val isNotFound: Boolean = false,
         val errorMessage: String? = null
     )
 
@@ -232,7 +244,6 @@ class GeminiLiveWebSocketClient(
         if (clean.startsWith("AIza")) {
             return connectOnce(clean, modelId, useBearerHeader = false)
         }
-        // AQ.Ab8... / Bearer token: try Authorization: Bearer first, retry once with ?key= on 401/403
         val bearerAttempt = connectOnce(clean, modelId, useBearerHeader = true)
         if (bearerAttempt.connected) return bearerAttempt
         if (bearerAttempt.httpCode in setOf(400, 401, 403) || bearerAttempt.isAuthFailure) {
@@ -254,6 +265,7 @@ class GeminiLiveWebSocketClient(
         var failureCode = 0
         var failureMsg: String? = null
         var authFail = false
+        var notFound = false
 
         val baseWsUrl =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -317,6 +329,9 @@ class GeminiLiveWebSocketClient(
                 authFail = reason.contains("API key", ignoreCase = true) ||
                     reason.contains("UNAUTHENTICATED", ignoreCase = true) ||
                     reason.contains("PERMISSION_DENIED", ignoreCase = true)
+                notFound = reason.contains("not found", ignoreCase = true) ||
+                    reason.contains("not supported", ignoreCase = true) ||
+                    code == 1008
                 isSetupComplete = false
                 setup.complete(false)
                 turnDeferred?.complete(
@@ -324,8 +339,14 @@ class GeminiLiveWebSocketClient(
                         transcript = turnTranscript.toString().trim(),
                         receivedNativeAudio = receivedAudioInTurn,
                         toolCalls = pendingToolCalls.toList(),
-                        httpCode = if (authFail) 401 else code,
+                        activeModelId = activeLiveModel,
+                        httpCode = when {
+                            authFail -> 401
+                            notFound -> 404
+                            else -> code
+                        },
                         isAuthFailure = authFail,
+                        isNotFound = notFound,
                         isRetryableError = true,
                         errorMessage = failureMsg
                     )
@@ -335,6 +356,7 @@ class GeminiLiveWebSocketClient(
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 failureCode = response?.code ?: 0
                 authFail = failureCode == 401 || failureCode == 403
+                notFound = failureCode == 404
                 failureMsg = response?.message?.takeIf { it.isNotBlank() }
                     ?: t.message
                     ?: "WebSocket failure ($failureCode)"
@@ -347,6 +369,7 @@ class GeminiLiveWebSocketClient(
                         toolCalls = emptyList(),
                         httpCode = failureCode,
                         isAuthFailure = authFail,
+                        isNotFound = notFound,
                         isRetryableError = true,
                         errorMessage = failureMsg
                     )
@@ -362,6 +385,7 @@ class GeminiLiveWebSocketClient(
             connected = ok,
             httpCode = failureCode,
             isAuthFailure = authFail,
+            isNotFound = notFound,
             errorMessage = failureMsg
         )
     }
@@ -401,7 +425,8 @@ class GeminiLiveWebSocketClient(
                             LiveTurnResult(
                                 transcript = turnTranscript.toString().trim(),
                                 receivedNativeAudio = receivedAudioInTurn,
-                                toolCalls = pendingToolCalls.toList()
+                                toolCalls = pendingToolCalls.toList(),
+                                activeModelId = activeLiveModel
                             )
                         )
                         return
@@ -445,7 +470,8 @@ class GeminiLiveWebSocketClient(
                     LiveTurnResult(
                         transcript = turnTranscript.toString().trim(),
                         receivedNativeAudio = receivedAudioInTurn,
-                        toolCalls = pendingToolCalls.toList()
+                        toolCalls = pendingToolCalls.toList(),
+                        activeModelId = activeLiveModel
                     )
                 )
             }

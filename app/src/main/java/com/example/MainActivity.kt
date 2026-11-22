@@ -153,6 +153,7 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
                 onBack = { navController.popBackStack() },
                 onSaveGeminiKeys = { k1, k2 -> viewModel.saveGeminiKeys(k1, k2) },
                 onTestApiConnection = { k1, k2 -> viewModel.testApiConnection(k1, k2) },
+                onSelectPreferredModel = { modelId -> viewModel.setPreferredModel(modelId) },
                 onSaveYouTubeCredentials = { apiKey, json ->
                     viewModel.saveYouTubeCredentials(apiKey, json)
                 },

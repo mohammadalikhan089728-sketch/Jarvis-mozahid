@@ -186,6 +186,14 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun setPreferredModel(modelId: String) {
+        app.vault.setPreferredModelId(modelId)
+        app.fallbackApiClient.resetRotationToStart()
+        _apiTestResult.value = null
+        val label = com.example.ai.ModelRingConfig.labelForPreference(modelId)
+        _settingsBanner.value = "Preferred model updated: $label"
+    }
+
     fun saveYouTubeCredentials(apiKey: String, oauthJson: String) {
         app.vault.saveYouTubeApiKey(apiKey)
         app.vault.saveYouTubeOAuthJson(oauthJson)

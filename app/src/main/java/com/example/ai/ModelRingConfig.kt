@@ -21,48 +21,58 @@ data class ActiveEngineState(
     val modelSlot: ModelSlot = ModelRingConfig.MODEL_RING.first(),
     val activeKeyNumber: Int = 1,
     val isLiveConnected: Boolean = false,
-    val hasConfiguredKeys: Boolean = false
+    val hasConfiguredKeys: Boolean = false,
+    val isAutoRotate: Boolean = true,
+    val resolvedModelId: String? = null
 ) {
     val badgeText: String
         get() = if (!hasConfiguredKeys) {
             "No API Key"
         } else {
-            "${modelSlot.badgeLabel} · K$activeKeyNumber"
+            val modePrefix = if (isAutoRotate) "" else "Locked · "
+            "$modePrefix${modelSlot.badgeLabel} · K$activeKeyNumber"
         }
 }
 
 object ModelRingConfig {
 
+    const val MODEL_MODE_AUTO = "auto"
+
     /**
-     * Exact 6-Model Circular Ring mapped to real, valid Google Gemini API model IDs:
-     * 1. gemini-3.1-flash-live-preview (Live WebSocket, with fallback live models)
-     * 2. gemini-2.5-flash              (UI badge: 3.8-flash)
-     * 3. gemini-2.5-flash-lite         (UI badge: 3.6-flash)
-     * 4. gemini-2.0-flash              (UI badge: 3.5-flash-lite)
-     * 5. gemini-2.0-flash-lite         (UI badge: decision-1)
-     * 6. gemini-1.5-flash              (UI badge: 4-hydrogen)
+     * Exact Active Model Priority Ring (Zero deprecated models):
+     * 1. gemini-3.1-flash-live-preview (Default Live Voice WebSocket BidiGenerateContent)
+     * 2. gemini-3.8-flash
+     * 3. gemini-3.6-flash
+     * 4. gemini-3.5-flash-lite
+     * 5. gemini-decision-1
+     * 6. gemini-4-hydrogen
      */
     val MODEL_RING: List<ModelSlot> = listOf(
-        ModelSlot("gemini-3.1-flash-live-preview", "3.1-live", isLiveWebSocket = true),
-        ModelSlot("gemini-2.5-flash", "3.8-flash", isLiveWebSocket = false),
-        ModelSlot("gemini-2.5-flash-lite", "3.6-flash", isLiveWebSocket = false),
-        ModelSlot("gemini-2.0-flash", "3.5-flash-lite", isLiveWebSocket = false),
-        ModelSlot("gemini-2.0-flash-lite", "decision-1", isLiveWebSocket = false),
-        ModelSlot("gemini-1.5-flash", "4-hydrogen", isLiveWebSocket = false)
+        ModelSlot("gemini-3.1-flash-live-preview", "3.1-flash-live-preview", isLiveWebSocket = true),
+        ModelSlot("gemini-3.8-flash", "3.8-flash", isLiveWebSocket = false),
+        ModelSlot("gemini-3.6-flash", "3.6-flash", isLiveWebSocket = false),
+        ModelSlot("gemini-3.5-flash-lite", "3.5-flash-lite", isLiveWebSocket = false),
+        ModelSlot("gemini-decision-1", "decision-1", isLiveWebSocket = false),
+        ModelSlot("gemini-4-hydrogen", "4-hydrogen", isLiveWebSocket = false)
     )
 
-    val LIVE_FALLBACK_MODELS: List<String> = listOf(
-        "gemini-3.1-flash-live-preview",
-        "gemini-2.5-flash-native-audio-preview-09-2025",
-        "gemini-2.0-flash-exp"
-    )
+    fun findSlotById(modelId: String): ModelSlot? {
+        return MODEL_RING.firstOrNull { it.modelId.equals(modelId.trim(), ignoreCase = true) }
+    }
+
+    fun labelForPreference(preferredModelId: String): String {
+        if (preferredModelId.isBlank() || preferredModelId == MODEL_MODE_AUTO) {
+            return "Auto-Rotate (Circular Fallback)"
+        }
+        return findSlotById(preferredModelId)?.badgeLabel ?: preferredModelId
+    }
 
     const val SYSTEM_PROMPT =
-        "You are JARVIS, an autonomous, high-speed Android AI assistant created by Mozahid. " +
+        "You are JARVIS, an intelligent, loyal Android AI assistant created by Mozahid. " +
             "Address your creator respectfully as 'Sir' or 'Mozahid Sir'. " +
             "Reply in the user's language (Hindi, Hinglish, or English) in 1 to 2 concise sentences. " +
-            "Never narrate steps—immediately execute multi-step actions in a loop using " +
-            "go_home, ui_read, ui_click, ui_type, and ui_scroll until the task is completely done. " +
+            "Execute multi-step phone actions autonomously in a loop using " +
+            "go_home, ui_read, ui_click, ui_type, and ui_scroll without narrating steps. " +
             "Keep token usage minimal."
 
     fun buildToolDeclarationsJson(): JSONArray {
@@ -195,12 +205,14 @@ object ModelRingConfig {
         )
         addTool(
             "set_jarvis_call_alarm",
-            "Schedule a JARVIS full-screen incoming voice-call alarm that rings over the lock screen and speaks the custom reason.",
+            "Schedule a JARVIS full-screen incoming voice-call alarm that rings over the lock screen and speaks the custom reason. Provide either (hour + minute in 24h time) or delay_minutes.",
             mapOf(
-                "delay_minutes" to ("INTEGER" to "Minutes from now until alarm rings"),
+                "hour" to ("INTEGER" to "Optional 24-hour clock hour (0-23) e.g. 6 for 6:00 AM"),
+                "minute" to ("INTEGER" to "Optional clock minute (0-59) e.g. 0"),
+                "delay_minutes" to ("INTEGER" to "Optional minutes from now if clock hour is not given"),
                 "reason" to ("STRING" to "Custom purpose e.g. Padhne ka time, Study time")
             ),
-            listOf("delay_minutes", "reason")
+            listOf("reason")
         )
         addTool(
             "save_memory",
