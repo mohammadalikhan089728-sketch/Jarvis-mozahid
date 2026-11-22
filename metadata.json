@@ -1,0 +1,6 @@
+{
+  "name": "JARVIS",
+  "description": "Minimal hands-free AI voice assistant with phone control, voice-call alarms, and YouTube automation. Created by Mozahid.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

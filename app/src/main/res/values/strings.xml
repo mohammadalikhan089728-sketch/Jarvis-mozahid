@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="created_by_mozahid">Created by Mozahid</string>
+    <string name="about_credits_label">JARVIS — Built by Mozahid</string>
+    <string name="accessibility_service_description">Allows JARVIS to inspect screens as compact text trees and perform hands-free taps, typing, scrolling, and messaging actions on your behalf.</string>
+    <string name="notification_listener_label">JARVIS Auto-Reply Listener</string>
+    <string name="cd_settings_button">Open JARVIS settings</string>
+    <string name="cd_back_button">Navigate back</string>
+    <string name="cd_jarvis_orb">JARVIS AI voice orb. Tap to talk, long press to type a command.</string>
+    <string name="cd_answer_call">Answer JARVIS call</string>
+    <string name="cd_decline_call">Decline JARVIS call</string>
+    <string name="cd_end_call">End JARVIS call</string>
+    <string name="cd_mute_mic">Toggle microphone mute</string>
+    <string name="cd_speaker_toggle">Toggle speakerphone</string>
+    <string name="cd_delete_memory">Delete saved memory</string>
+    <string name="cd_toggle_key_visibility">Toggle key visibility</string>
+    <string name="jarvis_calling_title">JARVIS Calling...</string>
+    <string name="jarvis_connected_title">JARVIS Connected</string>
+    <string name="swipe_to_answer">Slide to answer</string>
+    <string name="pill_status_controlling">JARVIS is using phone</string>
+    <string name="pill_stop_action">Stop</string>
+</resources>
