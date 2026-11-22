@@ -16,6 +16,8 @@ data class LiveTurnResult(
     val transcript: String,
     val receivedNativeAudio: Boolean,
     val toolCalls: List<ToolCallRequest>,
+    val httpCode: Int = 0,
+    val isAuthFailure: Boolean = false,
     val isRetryableError: Boolean = false,
     val errorMessage: String? = null
 )
@@ -27,17 +29,17 @@ data class ToolCallRequest(
 )
 
 /**
- * Multimodal Gemini Live WebSocket client (BidiGenerateContent) for `gemini-3.1-flash-live-preview`.
- * Supports universal API credentials:
- * - Standard AI Studio keys (`AIza...`): `?key=...` + `x-goog-api-key`
- * - Cloud / OAuth / Express Bearer tokens (`AQ.Ab8...`, `ya29...`, etc.): `Authorization: Bearer <token>`
- *   with automatic retry using `?key=` if handshake rejects Bearer.
- * Enforces Zero-Token-Wastage via single-turn `clientContent` payloads and `resumeHandle` reconnects.
+ * Multimodal Gemini Live WebSocket client (BidiGenerateContent):
+ * - Tries `models/gemini-3.1-flash-live-preview` with fast fallback to
+ *   `models/gemini-2.5-flash-native-audio-preview-09-2025` and `models/gemini-2.0-flash-exp`.
+ * - Smart Auth: `AIza...` -> `?key=...` + `x-goog-api-key`; `AQ.` / Bearer -> `Authorization: Bearer ...`
+ *   with automatic one-time retry using `?key=...` on 401/403.
+ * - Zero-Token-Wastage: single-turn `clientContent` payloads and `resumeHandle` reconnects.
  */
 class GeminiLiveWebSocketClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .connectTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 ) {
@@ -46,6 +48,9 @@ class GeminiLiveWebSocketClient(
 
     @Volatile
     private var activeApiKey: String = ""
+
+    @Volatile
+    private var activeLiveModel: String = ""
 
     @Volatile
     private var isSetupComplete = false
@@ -65,24 +70,48 @@ class GeminiLiveWebSocketClient(
 
     suspend fun sendSingleTurn(
         apiKey: String,
-        modelId: String,
+        primaryModelId: String,
         userText: String,
         memorySnippet: String?,
         onAudioBase64: (String) -> Unit,
         onTextDelta: (String) -> Unit
     ): LiveTurnResult {
+        val cleanKey = apiKey.trim()
         onAudioChunk = onAudioBase64
         onTranscriptDelta = onTextDelta
 
-        if (webSocket == null || !isSetupComplete || activeApiKey != apiKey) {
-            val connected = connectWithUniversalAuth(apiKey, modelId)
-            if (!connected.first) {
+        if (webSocket == null || !isSetupComplete || activeApiKey != cleanKey) {
+            val candidates = (listOf(primaryModelId) + ModelRingConfig.LIVE_FALLBACK_MODELS).distinct()
+            var lastCode = 0
+            var lastMsg: String? = null
+            var lastAuthFail = false
+            var connected = false
+
+            for (liveModel in candidates) {
+                val attempt = connectWithSmartAuth(cleanKey, liveModel)
+                if (attempt.connected) {
+                    activeLiveModel = liveModel
+                    connected = true
+                    break
+                }
+                lastCode = attempt.httpCode
+                lastMsg = attempt.errorMessage
+                lastAuthFail = attempt.isAuthFailure
+                if (attempt.isAuthFailure) {
+                    // Don't waste time trying other live models with the same rejected credential
+                    break
+                }
+            }
+
+            if (!connected) {
                 return LiveTurnResult(
                     transcript = "",
                     receivedNativeAudio = false,
                     toolCalls = emptyList(),
-                    isRetryableError = connected.second,
-                    errorMessage = connected.third
+                    httpCode = lastCode,
+                    isAuthFailure = lastAuthFail,
+                    isRetryableError = true,
+                    errorMessage = lastMsg ?: "Live WebSocket unavailable"
                 )
             }
         }
@@ -124,17 +153,20 @@ class GeminiLiveWebSocketClient(
                 receivedNativeAudio = false,
                 toolCalls = emptyList(),
                 isRetryableError = true,
-                errorMessage = "Live WebSocket send failed"
+                errorMessage = "Live WebSocket closed during send"
             )
         }
 
-        return withTimeoutOrNull(22_000L) { deferred.await() } ?: LiveTurnResult(
-            transcript = turnTranscript.toString().trim(),
-            receivedNativeAudio = receivedAudioInTurn,
-            toolCalls = pendingToolCalls.toList(),
-            isRetryableError = turnTranscript.isEmpty() && pendingToolCalls.isEmpty(),
-            errorMessage = "Live response timeout"
-        )
+        return withTimeoutOrNull(14_000L) { deferred.await() } ?: run {
+            close()
+            LiveTurnResult(
+                transcript = turnTranscript.toString().trim(),
+                receivedNativeAudio = receivedAudioInTurn,
+                toolCalls = pendingToolCalls.toList(),
+                isRetryableError = turnTranscript.isEmpty() && pendingToolCalls.isEmpty(),
+                errorMessage = "Live response timeout"
+            )
+        }
     }
 
     suspend fun sendToolResponses(
@@ -177,7 +209,7 @@ class GeminiLiveWebSocketClient(
             )
         }
 
-        return withTimeoutOrNull(20_000L) { deferred.await() } ?: LiveTurnResult(
+        return withTimeoutOrNull(14_000L) { deferred.await() } ?: LiveTurnResult(
             transcript = turnTranscript.toString().trim(),
             receivedNativeAudio = receivedAudioInTurn,
             toolCalls = pendingToolCalls.toList(),
@@ -185,33 +217,43 @@ class GeminiLiveWebSocketClient(
         )
     }
 
-    private suspend fun connectWithUniversalAuth(
+    private data class ConnectAttempt(
+        val connected: Boolean,
+        val httpCode: Int = 0,
+        val isAuthFailure: Boolean = false,
+        val errorMessage: String? = null
+    )
+
+    private suspend fun connectWithSmartAuth(
         credential: String,
         modelId: String
-    ): Triple<Boolean, Boolean, String?> {
+    ): ConnectAttempt {
         val clean = credential.trim()
-        val isStandardKey = clean.startsWith("AIza")
-        if (isStandardKey) {
+        if (clean.startsWith("AIza")) {
             return connectOnce(clean, modelId, useBearerHeader = false)
         }
-        // For AQ.Ab8... / OAuth / Express Bearer tokens: try Authorization: Bearer first,
-        // then automatically fall back to ?key= if the endpoint expects a query key.
+        // AQ.Ab8... / Bearer token: try Authorization: Bearer first, retry once with ?key= on 401/403
         val bearerAttempt = connectOnce(clean, modelId, useBearerHeader = true)
-        if (bearerAttempt.first) return bearerAttempt
-        return connectOnce(clean, modelId, useBearerHeader = false)
+        if (bearerAttempt.connected) return bearerAttempt
+        if (bearerAttempt.httpCode in setOf(400, 401, 403) || bearerAttempt.isAuthFailure) {
+            return connectOnce(clean, modelId, useBearerHeader = false)
+        }
+        return bearerAttempt
     }
 
     private suspend fun connectOnce(
         credential: String,
         modelId: String,
         useBearerHeader: Boolean
-    ): Triple<Boolean, Boolean, String?> {
+    ): ConnectAttempt {
         close()
         activeApiKey = credential
         isSetupComplete = false
         val setup = CompletableDeferred<Boolean>()
         setupDeferred = setup
+        var failureCode = 0
         var failureMsg: String? = null
+        var authFail = false
 
         val baseWsUrl =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
@@ -271,7 +313,10 @@ class GeminiLiveWebSocketClient(
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                failureMsg = "Live closed ($code): $reason"
+                failureMsg = reason.ifBlank { "Live closed ($code)" }
+                authFail = reason.contains("API key", ignoreCase = true) ||
+                    reason.contains("UNAUTHENTICATED", ignoreCase = true) ||
+                    reason.contains("PERMISSION_DENIED", ignoreCase = true)
                 isSetupComplete = false
                 setup.complete(false)
                 turnDeferred?.complete(
@@ -279,6 +324,8 @@ class GeminiLiveWebSocketClient(
                         transcript = turnTranscript.toString().trim(),
                         receivedNativeAudio = receivedAudioInTurn,
                         toolCalls = pendingToolCalls.toList(),
+                        httpCode = if (authFail) 401 else code,
+                        isAuthFailure = authFail,
                         isRetryableError = true,
                         errorMessage = failureMsg
                     )
@@ -286,8 +333,11 @@ class GeminiLiveWebSocketClient(
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                val code = response?.code ?: 0
-                failureMsg = t.message ?: "Live WebSocket failure ($code)"
+                failureCode = response?.code ?: 0
+                authFail = failureCode == 401 || failureCode == 403
+                failureMsg = response?.message?.takeIf { it.isNotBlank() }
+                    ?: t.message
+                    ?: "WebSocket failure ($failureCode)"
                 isSetupComplete = false
                 setup.complete(false)
                 turnDeferred?.complete(
@@ -295,6 +345,8 @@ class GeminiLiveWebSocketClient(
                         transcript = "",
                         receivedNativeAudio = false,
                         toolCalls = emptyList(),
+                        httpCode = failureCode,
+                        isAuthFailure = authFail,
                         isRetryableError = true,
                         errorMessage = failureMsg
                     )
@@ -302,11 +354,16 @@ class GeminiLiveWebSocketClient(
             }
         })
 
-        val ok = withTimeoutOrNull(8_000L) { setup.await() } == true
+        val ok = withTimeoutOrNull(4_500L) { setup.await() } == true
         if (!ok) {
             close()
         }
-        return Triple(ok, true, failureMsg)
+        return ConnectAttempt(
+            connected = ok,
+            httpCode = failureCode,
+            isAuthFailure = authFail,
+            errorMessage = failureMsg
+        )
     }
 
     private fun handleServerMessage(raw: String) {

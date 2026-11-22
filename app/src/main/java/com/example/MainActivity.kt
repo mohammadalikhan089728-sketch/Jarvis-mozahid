@@ -95,14 +95,8 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
     val config by viewModel.config.collectAsStateWithLifecycle()
     val memories by viewModel.memories.collectAsStateWithLifecycle()
     val settingsBanner by viewModel.settingsBanner.collectAsStateWithLifecycle()
-
-    val audioPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            viewModel.startVoiceListening()
-        }
-    }
+    val apiTestResult by viewModel.apiTestResult.collectAsStateWithLifecycle()
+    val isTestingApi by viewModel.isTestingApi.collectAsStateWithLifecycle()
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -131,18 +125,14 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
                 amplitude = amplitude,
                 engineState = engineState,
                 uploadProgress = uploadProgress,
-                onOrbTap = {
-                    val hasMic = ContextCompat.checkSelfPermission(
-                        context,
-                        Manifest.permission.RECORD_AUDIO
-                    ) == PackageManager.PERMISSION_GRANTED
+                onOrbTap = { hasAudioPermission, requestAudioPermission ->
                     viewModel.onOrbTapped(
-                        hasAudioPermission = hasMic,
-                        requestAudioPermission = {
-                            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                        }
+                        hasAudioPermission = hasAudioPermission,
+                        requestAudioPermission = requestAudioPermission
                     )
                 },
+                onMicPermissionGranted = { viewModel.startVoiceListening() },
+                onMicPermissionDenied = { viewModel.onMicPermissionDenied() },
                 onSubmitTextCommand = { cmd -> viewModel.submitCommand(cmd) },
                 onOpenSettings = {
                     viewModel.clearBanner()
@@ -158,8 +148,11 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
                 uploadProgress = uploadProgress,
                 memories = memories,
                 statusBanner = settingsBanner,
+                apiTestResult = apiTestResult,
+                isTestingApi = isTestingApi,
                 onBack = { navController.popBackStack() },
                 onSaveGeminiKeys = { k1, k2 -> viewModel.saveGeminiKeys(k1, k2) },
+                onTestApiConnection = { k1, k2 -> viewModel.testApiConnection(k1, k2) },
                 onSaveYouTubeCredentials = { apiKey, json ->
                     viewModel.saveYouTubeCredentials(apiKey, json)
                 },

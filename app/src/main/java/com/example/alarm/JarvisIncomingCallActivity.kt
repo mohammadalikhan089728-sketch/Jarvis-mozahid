@@ -234,8 +234,25 @@ class JarvisIncomingCallActivity : ComponentActivity() {
                     }
                 }
             },
-            onError = {
+            onAudioWavCaptured = { wavBase64 ->
+                callSubtitleState.value = "Processing voice, Sir..."
+                callAssistantState.value = AssistantState.THINKING
+                lifecycleScope.launch {
+                    val output = app.orchestrator.handleAudioCommand(wavBase64)
+                    callSubtitleState.value = output.spokenText
+                    callAssistantState.value = AssistantState.SPEAKING
+                    app.voiceEngine.speakNeural(output.spokenText) {
+                        if (isAnsweredState.value && !isMutedState.value) {
+                            listenForFollowUp(app)
+                        }
+                    }
+                }
+            },
+            onError = { errMsg ->
                 callAssistantState.value = AssistantState.IDLE
+                if (errMsg.isNotBlank()) {
+                    callSubtitleState.value = errMsg
+                }
             }
         )
     }

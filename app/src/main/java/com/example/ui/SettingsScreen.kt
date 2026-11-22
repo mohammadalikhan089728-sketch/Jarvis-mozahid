@@ -46,10 +46,13 @@ import androidx.compose.material.icons.outlined.UploadFile
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ErrorOutline
+import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,6 +89,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.R
 import com.example.ai.ActiveEngineState
+import com.example.ai.ApiConnectionTestResult
 import com.example.ai.ModelRingConfig
 import com.example.alarm.JarvisAlarmScheduler
 import com.example.control.ControlService
@@ -113,8 +117,11 @@ fun SettingsScreen(
     uploadProgress: YouTubeUploadProgressState,
     memories: List<MemoryEntity>,
     statusBanner: String?,
+    apiTestResult: ApiConnectionTestResult?,
+    isTestingApi: Boolean,
     onBack: () -> Unit,
     onSaveGeminiKeys: (String, String) -> Unit,
+    onTestApiConnection: (String, String) -> Unit,
     onSaveYouTubeCredentials: (apiKey: String, oauthJson: String) -> Unit,
     onConnectYouTube: () -> Unit,
     onManualOAuthCodeSubmit: (String) -> Unit,
@@ -495,6 +502,69 @@ fun SettingsScreen(
                             Icon(Icons.Outlined.Key, contentDescription = null, modifier = Modifier.size(18.dp))
                             Spacer(modifier = Modifier.width(8.dp))
                             Text("Save Encrypted Keys", style = MaterialTheme.typography.titleSmall)
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        OutlinedButton(
+                            onClick = { onTestApiConnection(key1, key2) },
+                            enabled = !isTestingApi,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("test_api_connection_button")
+                        ) {
+                            if (isTestingApi) {
+                                CircularProgressIndicator(
+                                    color = JarvisCyan,
+                                    strokeWidth = 2.dp,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text("Testing Gemini API...", style = MaterialTheme.typography.titleSmall, color = JarvisCyan)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Rounded.NetworkCheck,
+                                    contentDescription = null,
+                                    tint = JarvisCyan,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Test API Connection", style = MaterialTheme.typography.titleSmall, color = JarvisCyan)
+                            }
+                        }
+
+                        if (apiTestResult != null) {
+                            Spacer(modifier = Modifier.height(10.dp))
+                            val accent = if (apiTestResult.success) JarvisEmerald else JarvisCrimson
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(accent.copy(alpha = 0.12f))
+                                    .border(1.dp, accent.copy(alpha = 0.38f), RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                                    .testTag("api_test_result_banner")
+                            ) {
+                                Icon(
+                                    imageVector = if (apiTestResult.success) {
+                                        Icons.Rounded.CheckCircle
+                                    } else {
+                                        Icons.Rounded.ErrorOutline
+                                    },
+                                    contentDescription = if (apiTestResult.success) "Connected" else "Connection error",
+                                    tint = accent,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = apiTestResult.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = accent
+                                )
+                            }
                         }
                     }
                 }

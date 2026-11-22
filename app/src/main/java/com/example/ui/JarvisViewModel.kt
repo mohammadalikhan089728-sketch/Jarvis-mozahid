@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.JarvisApplication
 import com.example.ai.ActiveEngineState
+import com.example.ai.ApiConnectionTestResult
 import com.example.ai.AssistantState
 import com.example.alarm.JarvisAlarmScheduler
 import com.example.assistant.JarvisKeepAliveService
@@ -48,6 +49,12 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     private val _settingsBanner = MutableStateFlow<String?>(null)
     val settingsBanner: StateFlow<String?> = _settingsBanner.asStateFlow()
 
+    private val _apiTestResult = MutableStateFlow<ApiConnectionTestResult?>(null)
+    val apiTestResult: StateFlow<ApiConnectionTestResult?> = _apiTestResult.asStateFlow()
+
+    private val _isTestingApi = MutableStateFlow(false)
+    val isTestingApi: StateFlow<Boolean> = _isTestingApi.asStateFlow()
+
     private var activeJob: Job? = null
 
     init {
@@ -76,7 +83,8 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                 _subtitle.value = "Stopped, Sir."
             }
             AssistantState.IDLE -> {
-                if (!hasAudioPermission) {
+                val micGrantedLive = hasAudioPermission || app.voiceEngine.hasMicrophonePermission()
+                if (!micGrantedLive) {
                     requestAudioPermission()
                     return
                 }
@@ -85,7 +93,17 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun onMicPermissionDenied() {
+        _assistantState.value = AssistantState.IDLE
+        _subtitle.value = "Microphone permission is required for voice commands."
+    }
+
     fun startVoiceListening() {
+        if (!app.voiceEngine.hasMicrophonePermission()) {
+            _assistantState.value = AssistantState.IDLE
+            _subtitle.value = "Microphone permission is required for voice commands."
+            return
+        }
         _assistantState.value = AssistantState.LISTENING
         _subtitle.value = "Listening, Sir..."
         app.voiceEngine.startListening(
@@ -95,6 +113,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
             onFinalResult = { spoken ->
                 _subtitle.value = spoken
                 submitCommand(spoken)
+            },
+            onAudioWavCaptured = { wavBase64 ->
+                submitAudioCommand(wavBase64)
             },
             onError = { errMsg ->
                 _assistantState.value = AssistantState.IDLE
@@ -117,7 +138,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
                 onSubtitleUpdate = { sub -> _subtitle.value = sub }
             )
             _subtitle.value = output.spokenText
-            if (!output.alreadySpokenViaLiveAudio) {
+            if (output.isError || !output.alreadySpokenViaLiveAudio) {
                 _assistantState.value = AssistantState.SPEAKING
                 app.voiceEngine.speakNeural(output.spokenText) {
                     _assistantState.value = AssistantState.IDLE
@@ -128,11 +149,41 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun submitAudioCommand(audioWavBase64: String) {
+        activeJob?.cancel()
+        activeJob = viewModelScope.launch {
+            _subtitle.value = "Processing voice, Sir..."
+            val output = app.orchestrator.handleAudioCommand(
+                audioWavBase64 = audioWavBase64,
+                onStateChange = { st -> _assistantState.value = st },
+                onSubtitleUpdate = { sub -> _subtitle.value = sub }
+            )
+            _subtitle.value = output.spokenText
+            _assistantState.value = AssistantState.SPEAKING
+            app.voiceEngine.speakNeural(output.spokenText) {
+                _assistantState.value = AssistantState.IDLE
+            }
+        }
+    }
+
     fun saveGeminiKeys(key1: String, key2: String) {
-        app.vault.saveGeminiKeys(key1, key2)
-        app.fallbackApiClient.closeLiveSession()
-        app.fallbackApiClient.refreshState()
+        app.vault.saveGeminiKeys(key1.trim(), key2.trim())
+        app.fallbackApiClient.resetRotationToStart()
+        _apiTestResult.value = null
         _settingsBanner.value = "Gemini API keys (AIza / AQ. Bearer) encrypted & saved in Android Keystore."
+    }
+
+    fun testApiConnection(key1: String, key2: String) {
+        if (_isTestingApi.value) return
+        viewModelScope.launch {
+            _isTestingApi.value = true
+            _apiTestResult.value = null
+            app.vault.saveGeminiKeys(key1.trim(), key2.trim())
+            app.fallbackApiClient.resetRotationToStart()
+            val result = app.fallbackApiClient.testApiConnection()
+            _apiTestResult.value = result
+            _isTestingApi.value = false
+        }
     }
 
     fun saveYouTubeCredentials(apiKey: String, oauthJson: String) {

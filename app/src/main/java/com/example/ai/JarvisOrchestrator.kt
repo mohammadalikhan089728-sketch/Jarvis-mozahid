@@ -89,6 +89,47 @@ class JarvisOrchestrator(
         return output
     }
 
+    suspend fun handleAudioCommand(
+        audioWavBase64: String,
+        onStateChange: (AssistantState) -> Unit = {},
+        onSubtitleUpdate: (String) -> Unit = {}
+    ): AssistantTurnOutput {
+        ExecutionController.resetStopFlag()
+        onStateChange(AssistantState.THINKING)
+
+        var usedPhoneControl = false
+
+        return try {
+            fallbackApiClient.processAudioTurn(
+                audioWavBase64 = audioWavBase64,
+                shouldContinue = { ExecutionController.shouldContinue() },
+                executeTool = { name, args ->
+                    if (isScreenControlTool(name)) {
+                        if (!usedPhoneControl) {
+                            usedPhoneControl = true
+                            ExecutionController.beginControlSession()
+                            onStateChange(AssistantState.CONTROLLING)
+                            floatingPill.show {
+                                voiceEngine.stopSpeaking()
+                                onStateChange(AssistantState.IDLE)
+                            }
+                        }
+                    }
+                    executeToolByName(name, args)
+                },
+                onSubtitleUpdate = { partial ->
+                    if (partial.isNotBlank()) onSubtitleUpdate(partial)
+                }
+            )
+        } finally {
+            if (usedPhoneControl) {
+                ExecutionController.endControlSession()
+                floatingPill.hide()
+            }
+            voiceEngine.finishLiveAudioTurn()
+        }
+    }
+
     private fun isScreenControlTool(name: String): Boolean {
         return name in setOf(
             "go_home", "open_app", "ui_read", "ui_click", "ui_type", "ui_scroll", "ui_back",

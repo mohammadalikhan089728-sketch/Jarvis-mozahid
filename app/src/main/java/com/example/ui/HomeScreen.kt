@@ -43,7 +43,12 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -54,6 +59,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -62,6 +68,10 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.R
 import com.example.ai.ActiveEngineState
 import com.example.ai.AssistantState
@@ -94,12 +104,55 @@ fun HomeScreen(
     amplitude: Float,
     engineState: ActiveEngineState,
     uploadProgress: YouTubeUploadProgressState,
-    onOrbTap: () -> Unit,
+    onOrbTap: (hasAudioPermission: Boolean, requestAudioPermission: () -> Unit) -> Unit,
+    onMicPermissionGranted: () -> Unit,
+    onMicPermissionDenied: () -> Unit,
     onSubmitTextCommand: (String) -> Unit,
     onOpenSettings: () -> Unit
 ) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     var showCommandSheet by remember { mutableStateOf(false) }
     var quickCommandText by remember { mutableStateOf("") }
+    var micPermissionGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+
+    // Refresh RECORD_AUDIO status live whenever returning from Android System Settings
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                micPermissionGranted = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val verifiedNow = granted || ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        micPermissionGranted = verifiedNow
+        if (verifiedNow) {
+            onMicPermissionGranted()
+        } else {
+            onMicPermissionDenied()
+        }
+    }
+
     val orbDescription = stringResource(R.string.cd_jarvis_orb)
 
     Box(
@@ -216,7 +269,25 @@ fun HomeScreen(
                         .combinedClickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
-                            onClick = onOrbTap,
+                            onClick = {
+                                val liveGranted = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                                micPermissionGranted = liveGranted
+                                onOrbTap(liveGranted) {
+                                    // Only launch system dialog when checkSelfPermission actually returns DENIED
+                                    if (ContextCompat.checkSelfPermission(
+                                            context,
+                                            Manifest.permission.RECORD_AUDIO
+                                        ) == PackageManager.PERMISSION_DENIED
+                                    ) {
+                                        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    } else {
+                                        onMicPermissionGranted()
+                                    }
+                                }
+                            },
                             onLongClick = { showCommandSheet = true }
                         )
                         .testTag("jarvis_ai_orb")

@@ -34,21 +34,27 @@ data class ActiveEngineState(
 object ModelRingConfig {
 
     /**
-     * Exact 6-Model Circular Ring Order:
-     * 1. gemini-3.1-flash-live-preview (Multimodal Live WebSocket BidiGenerateContent)
-     * 2. gemini-3.8-flash
-     * 3. gemini-3.6-flash
-     * 4. gemini-3.5-flash-lite
-     * 5. gemini-decision-1
-     * 6. gemini-4-hydrogen
+     * Exact 6-Model Circular Ring mapped to real, valid Google Gemini API model IDs:
+     * 1. gemini-3.1-flash-live-preview (Live WebSocket, with fallback live models)
+     * 2. gemini-2.5-flash              (UI badge: 3.8-flash)
+     * 3. gemini-2.5-flash-lite         (UI badge: 3.6-flash)
+     * 4. gemini-2.0-flash              (UI badge: 3.5-flash-lite)
+     * 5. gemini-2.0-flash-lite         (UI badge: decision-1)
+     * 6. gemini-1.5-flash              (UI badge: 4-hydrogen)
      */
     val MODEL_RING: List<ModelSlot> = listOf(
         ModelSlot("gemini-3.1-flash-live-preview", "3.1-live", isLiveWebSocket = true),
-        ModelSlot("gemini-3.8-flash", "3.8-flash", isLiveWebSocket = false),
-        ModelSlot("gemini-3.6-flash", "3.6-flash", isLiveWebSocket = false),
-        ModelSlot("gemini-3.5-flash-lite", "3.5-lite", isLiveWebSocket = false),
-        ModelSlot("gemini-decision-1", "decision-1", isLiveWebSocket = false),
-        ModelSlot("gemini-4-hydrogen", "4-hydrogen", isLiveWebSocket = false)
+        ModelSlot("gemini-2.5-flash", "3.8-flash", isLiveWebSocket = false),
+        ModelSlot("gemini-2.5-flash-lite", "3.6-flash", isLiveWebSocket = false),
+        ModelSlot("gemini-2.0-flash", "3.5-flash-lite", isLiveWebSocket = false),
+        ModelSlot("gemini-2.0-flash-lite", "decision-1", isLiveWebSocket = false),
+        ModelSlot("gemini-1.5-flash", "4-hydrogen", isLiveWebSocket = false)
+    )
+
+    val LIVE_FALLBACK_MODELS: List<String> = listOf(
+        "gemini-3.1-flash-live-preview",
+        "gemini-2.5-flash-native-audio-preview-09-2025",
+        "gemini-2.0-flash-exp"
     )
 
     const val SYSTEM_PROMPT =
@@ -59,10 +65,6 @@ object ModelRingConfig {
             "go_home, ui_read, ui_click, ui_type, and ui_scroll until the task is completely done. " +
             "Keep token usage minimal."
 
-    /**
-     * Compact Gemini Function Declarations JSON for high-speed autonomous phone control,
-     * local memory, voice-call alarms, and background YouTube uploads.
-     */
     fun buildToolDeclarationsJson(): JSONArray {
         val declarations = JSONArray()
 
