@@ -7,10 +7,14 @@ import com.example.JarvisApplication
 import com.example.ai.ActiveEngineState
 import com.example.ai.AssistantState
 import com.example.alarm.JarvisAlarmScheduler
+import com.example.assistant.JarvisKeepAliveService
 import com.example.control.ExecutionController
 import com.example.data.JarvisConfigSnapshot
 import com.example.data.db.MemoryEntity
 import com.example.youtube.YouTubeAnalyticsWorker
+import com.example.youtube.YouTubeUploadProgressState
+import com.example.youtube.YouTubeUploadProgressStore
+import com.example.youtube.YouTubeUploadWorker
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -24,8 +28,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     private val app = application as JarvisApplication
 
     val config: StateFlow<JarvisConfigSnapshot> = app.vault.configFlow
-    val engineState: StateFlow<ActiveEngineState> = app.fallbackEngine.engineState
+    val engineState: StateFlow<ActiveEngineState> = app.fallbackApiClient.engineState
     val amplitude: StateFlow<Float> = app.voiceEngine.amplitude
+    val uploadProgress: StateFlow<YouTubeUploadProgressState> = YouTubeUploadProgressStore.state
 
     val memories: StateFlow<List<MemoryEntity>> = app.memoryRepository.allMemories
         .stateIn(
@@ -125,9 +130,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun saveGeminiKeys(key1: String, key2: String) {
         app.vault.saveGeminiKeys(key1, key2)
-        app.fallbackEngine.closeLiveSession()
-        app.fallbackEngine.refreshState()
-        _settingsBanner.value = "Gemini API keys encrypted & saved in Android Keystore."
+        app.fallbackApiClient.closeLiveSession()
+        app.fallbackApiClient.refreshState()
+        _settingsBanner.value = "Gemini API keys (AIza / AQ. Bearer) encrypted & saved in Android Keystore."
     }
 
     fun saveYouTubeCredentials(apiKey: String, oauthJson: String) {
@@ -156,14 +161,9 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun uploadWatchFolderNow() {
-        viewModelScope.launch {
-            _settingsBanner.value = "Scanning watch folder for video & .txt note..."
-            val outcome = app.youtubeUploader.uploadLatestFromWatchFolder { status ->
-                _settingsBanner.value = status
-            }
-            _settingsBanner.value = outcome.message
-        }
+    fun enqueueBackgroundYouTubeUpload(spokenTopic: String? = null) {
+        YouTubeUploadWorker.enqueue(app.applicationContext, spokenTopic = spokenTopic)
+        _settingsBanner.value = "Background YouTube Auto-SEO upload started with live progress."
     }
 
     fun runYouTubeAnalyticsCheckNow() {
@@ -180,7 +180,16 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setAutoReplyEnabled(enabled: Boolean) {
         app.vault.setAutoReplyEnabled(enabled)
-        _settingsBanner.value = if (enabled) "Auto-Reply enabled for WhatsApp & SMS." else "Auto-Reply disabled."
+        _settingsBanner.value = if (enabled) "Hands-free Auto-Reply enabled." else "Auto-Reply disabled."
+    }
+
+    fun setProactiveWhatsAppCallsEnabled(enabled: Boolean) {
+        app.vault.setProactiveWhatsAppCallsEnabled(enabled)
+        _settingsBanner.value = if (enabled) {
+            "Proactive WhatsApp Alerts & Urgent Voice Calls enabled."
+        } else {
+            "Proactive WhatsApp Alerts paused."
+        }
     }
 
     fun setProactiveYouTubeCallsEnabled(enabled: Boolean) {
@@ -191,6 +200,17 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         } else {
             YouTubeAnalyticsWorker.cancel(app.applicationContext)
             _settingsBanner.value = "Proactive YouTube Advisor monitor paused."
+        }
+    }
+
+    fun setBackgroundKeepAliveEnabled(enabled: Boolean) {
+        app.vault.setBackgroundKeepAliveEnabled(enabled)
+        if (enabled) {
+            JarvisKeepAliveService.start(app.applicationContext)
+            _settingsBanner.value = "Persistent Background Keep-Alive Service started."
+        } else {
+            JarvisKeepAliveService.stop(app.applicationContext)
+            _settingsBanner.value = "Background Keep-Alive Service stopped."
         }
     }
 
@@ -215,7 +235,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun triggerTestJarvisCall() {
         JarvisAlarmScheduler.triggerImmediateCall(
             context = app.applicationContext,
-            reason = "Study time",
+            reason = "Padhne ka time",
             callType = JarvisAlarmScheduler.CALL_TYPE_ALARM
         )
     }

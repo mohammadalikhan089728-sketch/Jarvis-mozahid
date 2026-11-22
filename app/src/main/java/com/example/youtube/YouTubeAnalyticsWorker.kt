@@ -180,7 +180,7 @@ class YouTubeAnalyticsWorker(
                         "Sir, quick YouTube briefing. Your latest video $latestTitle is pacing slower at $latestViews views compared to your average of $avgViews. I recommend testing a higher-contrast thumbnail and sharper hook title to lift CTR."
                     }
 
-                    val polished = app.fallbackEngine.generateCompactText(
+                    val polished = app.fallbackApiClient.generateCompactText(
                         prompt = "Rewrite this YouTube advisor phone briefing for Mozahid Sir in 2 crisp, encouraging spoken sentences: $rawBriefing"
                     ) ?: rawBriefing
 

@@ -1,9 +1,10 @@
 package com.example
 
 import android.app.Application
-import com.example.ai.CircularFallbackEngine
+import com.example.ai.FallbackApiClient
 import com.example.ai.JarvisOrchestrator
 import com.example.ai.VoiceEngine
+import com.example.assistant.JarvisKeepAliveService
 import com.example.control.DeviceActionHelper
 import com.example.control.FloatingPillManager
 import com.example.data.SecureVault
@@ -30,7 +31,7 @@ class JarvisApplication : Application() {
     lateinit var voiceEngine: VoiceEngine
         private set
 
-    lateinit var fallbackEngine: CircularFallbackEngine
+    lateinit var fallbackApiClient: FallbackApiClient
         private set
 
     lateinit var floatingPill: FloatingPillManager
@@ -54,23 +55,25 @@ class JarvisApplication : Application() {
         database = JarvisDatabase.getInstance(this)
         memoryRepository = MemoryRepository(database.memoryDao(), database.alarmDao())
         voiceEngine = VoiceEngine(this)
-        fallbackEngine = CircularFallbackEngine(vault, memoryRepository)
+        fallbackApiClient = FallbackApiClient(vault, memoryRepository)
         floatingPill = FloatingPillManager(this)
         deviceActions = DeviceActionHelper(this)
         youtubeOAuth = YouTubeOAuthManager(vault)
-        youtubeUploader = YouTubeUploader(this, vault, youtubeOAuth, fallbackEngine)
+        youtubeUploader = YouTubeUploader(this, vault, youtubeOAuth, fallbackApiClient)
         orchestrator = JarvisOrchestrator(
             context = this,
-            fallbackEngine = fallbackEngine,
+            fallbackApiClient = fallbackApiClient,
             voiceEngine = voiceEngine,
             memoryRepository = memoryRepository,
             deviceActions = deviceActions,
-            floatingPill = floatingPill,
-            youtubeUploader = youtubeUploader
+            floatingPill = floatingPill
         )
 
         if (vault.isProactiveYouTubeCallsEnabled()) {
             YouTubeAnalyticsWorker.schedule(this)
+        }
+        if (vault.isBackgroundKeepAliveEnabled()) {
+            JarvisKeepAliveService.start(this)
         }
     }
 }

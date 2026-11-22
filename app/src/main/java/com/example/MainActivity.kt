@@ -20,6 +20,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.example.assistant.JarvisVoiceInteractionSession
 import com.example.ui.HomeScreen
 import com.example.ui.JarvisViewModel
 import com.example.ui.SettingsScreen
@@ -35,7 +36,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleOAuthRedirectIntent(intent)
+        handleIncomingIntent(intent)
 
         setContent {
             JarvisTheme {
@@ -47,15 +48,35 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleOAuthRedirectIntent(intent)
+        handleIncomingIntent(intent)
     }
 
-    private fun handleOAuthRedirectIntent(intent: Intent?) {
-        val data = intent?.data ?: return
-        if (data.scheme == "com.aistudio.jarvis.mzhkqr" && data.path == "/oauth2redirect") {
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+
+        // 1. OAuth 2.0 Redirect URI Handler for YouTube Channel Verification
+        val data = intent.data
+        if (data != null && data.scheme == "com.aistudio.jarvis.mzhkqr" && data.path == "/oauth2redirect") {
             val authCode = data.getQueryParameter("code")
             if (!authCode.isNullOrBlank()) {
                 viewModel.handleOAuthAuthorizationCode(authCode)
+                return
+            }
+        }
+
+        // 2. Digital Assistant Summon (ACTION_ASSIST, ACTION_VOICE_COMMAND, or VoiceInteractionSession)
+        val isAssistantSummon = intent.action == Intent.ACTION_ASSIST ||
+            intent.action == Intent.ACTION_VOICE_COMMAND ||
+            intent.action == JarvisVoiceInteractionSession.ACTION_SUMMON_JARVIS ||
+            intent.getBooleanExtra(JarvisVoiceInteractionSession.EXTRA_AUTO_LISTEN, false)
+
+        if (isAssistantSummon) {
+            val hasMic = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasMic) {
+                viewModel.startVoiceListening()
             }
         }
     }
@@ -70,6 +91,7 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
     val subtitle by viewModel.subtitle.collectAsStateWithLifecycle()
     val amplitude by viewModel.amplitude.collectAsStateWithLifecycle()
     val engineState by viewModel.engineState.collectAsStateWithLifecycle()
+    val uploadProgress by viewModel.uploadProgress.collectAsStateWithLifecycle()
     val config by viewModel.config.collectAsStateWithLifecycle()
     val memories by viewModel.memories.collectAsStateWithLifecycle()
     val settingsBanner by viewModel.settingsBanner.collectAsStateWithLifecycle()
@@ -108,6 +130,7 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
                 subtitle = subtitle,
                 amplitude = amplitude,
                 engineState = engineState,
+                uploadProgress = uploadProgress,
                 onOrbTap = {
                     val hasMic = ContextCompat.checkSelfPermission(
                         context,
@@ -132,6 +155,7 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
             SettingsScreen(
                 config = config,
                 engineState = engineState,
+                uploadProgress = uploadProgress,
                 memories = memories,
                 statusBanner = settingsBanner,
                 onBack = { navController.popBackStack() },
@@ -141,10 +165,12 @@ private fun JarvisAppNavigation(viewModel: JarvisViewModel) {
                 },
                 onConnectYouTube = { viewModel.connectAndVerifyYouTube() },
                 onManualOAuthCodeSubmit = { code -> viewModel.handleOAuthAuthorizationCode(code) },
-                onUploadWatchFolderNow = { viewModel.uploadWatchFolderNow() },
+                onUploadWatchFolderNow = { viewModel.enqueueBackgroundYouTubeUpload() },
                 onRunYouTubeAnalyticsCheck = { viewModel.runYouTubeAnalyticsCheckNow() },
                 onToggleAutoReply = { viewModel.setAutoReplyEnabled(it) },
+                onToggleProactiveWhatsAppCalls = { viewModel.setProactiveWhatsAppCallsEnabled(it) },
                 onToggleProactiveYouTubeCalls = { viewModel.setProactiveYouTubeCallsEnabled(it) },
+                onToggleBackgroundKeepAlive = { viewModel.setBackgroundKeepAliveEnabled(it) },
                 onWatchFolderPicked = { uri, name -> viewModel.saveWatchFolder(uri, name) },
                 onAddMemory = { viewModel.addMemory(it) },
                 onDeleteMemory = { viewModel.deleteMemory(it) },

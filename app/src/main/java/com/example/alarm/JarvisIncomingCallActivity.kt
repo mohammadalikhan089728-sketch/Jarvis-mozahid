@@ -186,10 +186,10 @@ class JarvisIncomingCallActivity : ComponentActivity() {
             lifecycleScope.launch { app.memoryRepository.deactivateAlarm(alarmId) }
         }
 
-        val openingSpeech = if (callType == JarvisAlarmScheduler.CALL_TYPE_YOUTUBE_ADVISOR) {
-            callReason
-        } else {
-            "Sir, it's time for $callReason. You set an alarm for this, please get started. I'm on the line if you need anything."
+        val openingSpeech = when (callType) {
+            JarvisAlarmScheduler.CALL_TYPE_YOUTUBE_ADVISOR,
+            JarvisAlarmScheduler.CALL_TYPE_WHATSAPP_ALERT -> callReason
+            else -> "Mozahid Sir, it is time for $callReason. You set an alarm for this, please get started. I'm on the line if you need anything."
         }
 
         callSubtitleState.value = openingSpeech
@@ -328,6 +328,7 @@ private fun IncomingCallScreen(
                 val label = when {
                     answered -> timerText
                     callType == JarvisAlarmScheduler.CALL_TYPE_YOUTUBE_ADVISOR -> "YouTube Advisor · Priority Call"
+                    callType == JarvisAlarmScheduler.CALL_TYPE_WHATSAPP_ALERT -> "WhatsApp Priority Alert"
                     else -> "Voice-Call Alarm · ${reason.take(42)}"
                 }
                 Text(

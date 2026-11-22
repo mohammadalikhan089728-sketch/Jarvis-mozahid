@@ -1,6 +1,7 @@
 package com.example.ui
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -35,6 +36,7 @@ import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -51,6 +53,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -72,13 +75,15 @@ import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.youtube.YouTubeUploadProgressState
 
 /**
- * Ultra-Clean Minimal Home Screen:
- * - Pure obsidian (#0A0E14) background with zero clutter (no cards, boxes, or grids).
- * - Top Bar: "JARVIS" on top-left, subtle active model indicator badge, single Settings gear icon on top-right.
- * - Centerpiece: Smooth, fluid, glowing animated AI Orb (tap to speak/stop, long-press for silent command input).
+ * Ultra-Clean Minimal Home Screen (kept 100% pure & uncluttered):
+ * - Obsidian (#0A0E14) background with zero cards, boxes, or grids.
+ * - Top Bar: "JARVIS" on top-left, subtle active model badge, single Settings gear icon top-right.
+ * - Centerpiece: Glowing fluid animated AI Orb (tap to speak/stop; long-press for silent text input).
  * - Below Orb: Minimal 2-line live subtitle text.
+ * - Clean subtle progress indicator appears ONLY while a background YouTube upload is actively running.
  * - Subtle Footer: "Created by Mozahid".
  */
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
@@ -88,6 +93,7 @@ fun HomeScreen(
     subtitle: String,
     amplitude: Float,
     engineState: ActiveEngineState,
+    uploadProgress: YouTubeUploadProgressState,
     onOrbTap: () -> Unit,
     onSubmitTextCommand: (String) -> Unit,
     onOpenSettings: () -> Unit
@@ -146,7 +152,6 @@ fun HomeScreen(
                         modifier = Modifier.testTag("home_title_jarvis")
                     )
 
-                    // Subtle active model indicator badge
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
@@ -246,19 +251,68 @@ fun HomeScreen(
                 }
             }
 
-            // Subtle Footer Credit
-            Text(
-                text = stringResource(R.string.created_by_mozahid),
-                style = MaterialTheme.typography.labelSmall,
-                color = TextMuted.copy(alpha = 0.65f),
+            // Bottom area: Subtle background YouTube upload progress (only when uploading) + Credit Footer
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier
+                    .fillMaxWidth()
                     .padding(bottom = 12.dp)
-                    .testTag("footer_credit_mozahid")
-            )
+            ) {
+                AnimatedVisibility(
+                    visible = uploadProgress.isUploading,
+                    enter = fadeIn(tween(250)),
+                    exit = fadeOut(tween(250))
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .fillMaxWidth(0.76f)
+                            .padding(bottom = 14.dp)
+                            .testTag("home_youtube_upload_progress")
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = uploadProgress.statusText.ifBlank { "Uploading to YouTube..." },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "${uploadProgress.percent}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = JarvisCyan
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        LinearProgressIndicator(
+                            progress = { (uploadProgress.percent / 100f).coerceIn(0f, 1f) },
+                            color = JarvisCyan,
+                            trackColor = ObsidianBorder,
+                            strokeCap = StrokeCap.Round,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(3.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    text = stringResource(R.string.created_by_mozahid),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextMuted.copy(alpha = 0.65f),
+                    modifier = Modifier.testTag("footer_credit_mozahid")
+                )
+            }
         }
     }
 
-    // Optional silent text-command modal triggered only on long-press of the Orb
     if (showCommandSheet) {
         ModalBottomSheet(
             onDismissRequest = { showCommandSheet = false },
@@ -284,7 +338,7 @@ fun HomeScreen(
                     onValueChange = { quickCommandText = it },
                     placeholder = {
                         Text(
-                            "e.g. Set alarm in 1 minute for Study time",
+                            "e.g. Home screen pe jao, YouTube kholo aur video upload karo",
                             color = TextMuted
                         )
                     },

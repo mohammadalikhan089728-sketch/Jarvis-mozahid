@@ -17,6 +17,7 @@ object JarvisAlarmScheduler {
 
     const val CALL_TYPE_ALARM = "alarm"
     const val CALL_TYPE_YOUTUBE_ADVISOR = "youtube_advisor"
+    const val CALL_TYPE_WHATSAPP_ALERT = "whatsapp_alert"
 
     fun canScheduleExactAlarms(context: Context): Boolean {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager

@@ -3,7 +3,7 @@ package com.example.youtube
 import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
-import com.example.ai.CircularFallbackEngine
+import com.example.ai.FallbackApiClient
 import com.example.data.SecureVault
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -13,7 +13,6 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
-import okio.source
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
@@ -33,25 +32,26 @@ data class YouTubeUploadOutcome(
 
 /**
  * Folder-to-YouTube Auto-SEO Uploader:
- * - Reads newest video and accompanying `.txt` topic note from the SAF Watch Folder (`Jarvis_Uploads`).
- * - Generates high-CTR viral Title, SEO Description, and Tags via the active Gemini circular engine.
- * - Streams video bytes directly to YouTube Data API v3 (`videos.insert` resumable upload).
+ * - Reads newest video + `.txt` topic note (in Hindi, Hinglish, or English) from Watch Folder.
+ * - Uses active FallbackApiClient model to generate high-CTR viral SEO Title, Description, and Tags
+ *   matching the topic's target language.
+ * - Uploads via YouTube Data API v3 (`videos.insert` resumable upload) with live byte-level percentage callbacks.
  */
 class YouTubeUploader(
     private val context: Context,
     private val vault: SecureVault,
     private val oauthManager: YouTubeOAuthManager,
-    private val fallbackEngine: CircularFallbackEngine
+    private val fallbackApiClient: FallbackApiClient
 ) {
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .writeTimeout(180, TimeUnit.SECONDS)
+        .writeTimeout(300, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
     suspend fun uploadLatestFromWatchFolder(
         spokenTopic: String? = null,
-        onStatus: (String) -> Unit = {}
+        onProgress: (percent: Int, status: String) -> Unit = { _, _ -> }
     ): YouTubeUploadOutcome = withContext(Dispatchers.IO) {
         val folderUriStr = vault.getWatchFolderUri()
         if (folderUriStr.isBlank()) {
@@ -64,9 +64,10 @@ class YouTubeUploader(
         val accessToken = oauthManager.getValidAccessToken()
             ?: return@withContext YouTubeUploadOutcome(
                 success = false,
-                message = "YouTube channel not connected. Please verify in Settings first."
+                message = "YouTube channel not connected. Please connect & verify in Settings."
             )
 
+        onProgress(2, "Scanning ${vault.getWatchFolderName()}...")
         val folder = DocumentFile.fromTreeUri(context, Uri.parse(folderUriStr))
             ?: return@withContext YouTubeUploadOutcome(
                 success = false,
@@ -105,10 +106,10 @@ class YouTubeUploader(
             if (isEmpty()) append(videoBaseName.replace('_', ' ').replace('-', ' '))
         }.trim()
 
-        onStatus("Generating high-CTR SEO metadata...")
+        onProgress(8, "Generating viral SEO metadata...")
         val seo = generateViralSeo(topicContext, videoBaseName)
 
-        onStatus("Initiating resumable upload to YouTube...")
+        onProgress(14, "Initializing YouTube resumable upload...")
         val mimeType = videoFile.type ?: "video/mp4"
         val fileLength = videoFile.length()
 
@@ -164,13 +165,37 @@ class YouTubeUploader(
             message = "YouTube did not return a resumable upload Location."
         )
 
-        onStatus("Uploading ${videoFile.name} to YouTube...")
-        val streamBody = object : RequestBody() {
+        onProgress(15, "Uploading ${seo.title.take(28)}...")
+        val totalBytes = fileLength.coerceAtLeast(1L)
+
+        val progressBody = object : RequestBody() {
             override fun contentType() = mimeType.toMediaType()
             override fun contentLength(): Long = if (fileLength > 0L) fileLength else -1L
+
             override fun writeTo(sink: BufferedSink) {
+                val buffer = ByteArray(64 * 1024)
+                var uploaded = 0L
+                var lastReportedPercent = 15
+
                 context.contentResolver.openInputStream(videoFile.uri)?.use { input ->
-                    sink.writeAll(input.source())
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        sink.write(buffer, 0, read)
+                        uploaded += read
+
+                        val rawPct = if (fileLength > 0L) {
+                            15 + ((uploaded * 84L) / totalBytes).toInt()
+                        } else {
+                            (lastReportedPercent + 1).coerceAtMost(95)
+                        }
+                        val clamped = rawPct.coerceIn(15, 99)
+                        if (clamped > lastReportedPercent) {
+                            lastReportedPercent = clamped
+                            onProgress(clamped, "Uploading ${seo.title.take(24)} · $clamped%")
+                        }
+                    }
+                    sink.flush()
                 }
             }
         }
@@ -178,7 +203,7 @@ class YouTubeUploader(
         val putRequest = Request.Builder()
             .url(uploadSessionUri)
             .addHeader("Authorization", "Bearer $accessToken")
-            .put(streamBody)
+            .put(progressBody)
             .build()
 
         try {
@@ -191,6 +216,7 @@ class YouTubeUploader(
                     )
                 }
                 val videoId = runCatching { JSONObject(raw).optString("id", "") }.getOrDefault("")
+                onProgress(100, "Uploaded '${seo.title}'")
                 YouTubeUploadOutcome(
                     success = true,
                     videoId = videoId,
@@ -208,19 +234,19 @@ class YouTubeUploader(
 
     private suspend fun generateViralSeo(topicContext: String, fallbackName: String): GeneratedSeoMetadata {
         val prompt = """
-            Generate high-CTR viral YouTube SEO metadata for this video topic:
+            Generate high-CTR viral YouTube SEO metadata in the SAME language as the topic below (Hindi, Hinglish, or English):
             "$topicContext"
-            Return STRICT JSON only with keys:
+            Return STRICT JSON only:
             {
-              "title": "compelling under-70-char viral title",
-              "description": "engaging SEO-rich description with hashtags",
+              "title": "compelling viral title under 70 chars",
+              "description": "SEO-optimized description with relevant hashtags",
               "tags": ["tag1", "tag2", "tag3", "tag4", "tag5", "tag6", "tag7", "tag8"]
             }
         """.trimIndent()
 
-        val raw = fallbackEngine.generateCompactText(
+        val raw = fallbackApiClient.generateCompactText(
             prompt = prompt,
-            systemInstruction = "You are a YouTube growth & SEO strategist. Return strictly valid JSON only.",
+            systemInstruction = "You are a YouTube growth & SEO strategist. Match the user's language (Hindi, Hinglish, or English). Return strictly valid JSON only.",
             expectJson = true
         )
 

@@ -1,7 +1,15 @@
 package com.example.ui
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -24,15 +32,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Assistant
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Key
-import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material.icons.outlined.PhoneCallback
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.UploadFile
@@ -46,6 +53,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -63,6 +71,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -70,6 +79,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -79,7 +89,7 @@ import com.example.ai.ActiveEngineState
 import com.example.ai.ModelRingConfig
 import com.example.alarm.JarvisAlarmScheduler
 import com.example.control.ControlService
-import com.example.control.JarvisNotificationService
+import com.example.control.NotificationWatchService
 import com.example.data.JarvisConfigSnapshot
 import com.example.data.db.MemoryEntity
 import com.example.ui.theme.JarvisCrimson
@@ -93,11 +103,14 @@ import com.example.ui.theme.ObsidianSurfaceVariant
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.youtube.YouTubeUploadProgressState
 
+@SuppressLint("BatteryLife")
 @Composable
 fun SettingsScreen(
     config: JarvisConfigSnapshot,
     engineState: ActiveEngineState,
+    uploadProgress: YouTubeUploadProgressState,
     memories: List<MemoryEntity>,
     statusBanner: String?,
     onBack: () -> Unit,
@@ -108,7 +121,9 @@ fun SettingsScreen(
     onUploadWatchFolderNow: () -> Unit,
     onRunYouTubeAnalyticsCheck: () -> Unit,
     onToggleAutoReply: (Boolean) -> Unit,
+    onToggleProactiveWhatsAppCalls: (Boolean) -> Unit,
     onToggleProactiveYouTubeCalls: (Boolean) -> Unit,
+    onToggleBackgroundKeepAlive: (Boolean) -> Unit,
     onWatchFolderPicked: (uri: String, displayName: String) -> Unit,
     onAddMemory: (String) -> Unit,
     onDeleteMemory: (Long) -> Unit,
@@ -134,26 +149,35 @@ fun SettingsScreen(
     var showAddMemoryDialog by remember { mutableStateOf(false) }
     var newMemoryText by remember { mutableStateOf("") }
 
-    // Live Android System Permission / Service Statuses refreshed onResume
+    // Live interactive permissions checklist statuses
     var accessibilityEnabled by remember { mutableStateOf(ControlService.isEnabled(context)) }
-    var notificationAccessEnabled by remember { mutableStateOf(JarvisNotificationService.isEnabled(context)) }
+    var notificationAccessEnabled by remember { mutableStateOf(NotificationWatchService.isEnabled(context)) }
     var overlayEnabled by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
-    var exactAlarmEnabled by remember { mutableStateOf(JarvisAlarmScheduler.canScheduleExactAlarms(context)) }
+    var exactAlarmAndFullScreenEnabled by remember { mutableStateOf(checkAlarmAndFullScreenReady(context)) }
+    var batteryUnrestricted by remember { mutableStateOf(checkBatteryUnrestricted(context)) }
+    var allFilesStorageGranted by remember { mutableStateOf(checkStorageGranted(context)) }
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 accessibilityEnabled = ControlService.isEnabled(context)
-                notificationAccessEnabled = JarvisNotificationService.isEnabled(context)
+                notificationAccessEnabled = NotificationWatchService.isEnabled(context)
                 overlayEnabled = Settings.canDrawOverlays(context)
-                exactAlarmEnabled = JarvisAlarmScheduler.canScheduleExactAlarms(context)
+                exactAlarmAndFullScreenEnabled = checkAlarmAndFullScreenReady(context)
+                batteryUnrestricted = checkBatteryUnrestricted(context)
+                allFilesStorageGranted = checkStorageGranted(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // SAF Picker for OAuth 2.0 Client Credentials JSON file
+    val legacyStorageLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        allFilesStorageGranted = granted || checkStorageGranted(context)
+    }
+
     val jsonPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
@@ -167,7 +191,6 @@ fun SettingsScreen(
         }
     }
 
-    // SAF Picker for Watch Folder (e.g. Jarvis_Uploads)
     val folderPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { uri: Uri? ->
@@ -256,16 +279,187 @@ fun SettingsScreen(
             ) {
                 item { Spacer(modifier = Modifier.height(4.dp)) }
 
+                // 0. INTERACTIVE PERMISSIONS HUB & SYSTEM DEFAULT ASSISTANT
+                item {
+                    SettingsSectionCard(
+                        title = "Permissions Checklist & Default Assistant",
+                        subtitle = "1-tap grants for full phone control, background survival & lock-screen calls"
+                    ) {
+                        Button(
+                            onClick = {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
+                                }.onFailure {
+                                    context.startActivity(Intent(Settings.ACTION_SETTINGS))
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = JarvisCyan,
+                                contentColor = ObsidianBackground
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("set_default_assistant_button")
+                        ) {
+                            Icon(Icons.Outlined.Assistant, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Set JARVIS as Default Assistant", style = MaterialTheme.typography.titleSmall)
+                        }
+
+                        Spacer(modifier = Modifier.height(14.dp))
+
+                        PermissionActionRow(
+                            index = "1",
+                            title = "Accessibility Service",
+                            subtitle = "Full human-like phone control & text-tree reading",
+                            granted = accessibilityEnabled,
+                            onGrantClick = {
+                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            },
+                            tag = "perm_accessibility_button"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+
+                        PermissionActionRow(
+                            index = "2",
+                            title = "Notification Listener",
+                            subtitle = "Smart WhatsApp alerts & hands-free Auto-Reply",
+                            granted = notificationAccessEnabled,
+                            onGrantClick = {
+                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                            },
+                            tag = "perm_notification_listener_button"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+
+                        PermissionActionRow(
+                            index = "3",
+                            title = "Display Over Other Apps",
+                            subtitle = "Top floating 'JARVIS is using phone' pill & lock-screen calls",
+                            granted = overlayEnabled,
+                            onGrantClick = {
+                                context.startActivity(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        Uri.parse("package:${context.packageName}")
+                                    )
+                                )
+                            },
+                            tag = "perm_overlay_button"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+
+                        PermissionActionRow(
+                            index = "4",
+                            title = "Full-Screen Intent & Exact Alarms",
+                            subtitle = "Wake screen over lock screen for voice-call alarms",
+                            granted = exactAlarmAndFullScreenEnabled,
+                            onGrantClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                                    val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                                    if (!nm.canUseFullScreenIntent()) {
+                                        runCatching {
+                                            context.startActivity(
+                                                Intent(
+                                                    Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                                    Uri.parse("package:${context.packageName}")
+                                                )
+                                            )
+                                        }
+                                        return@PermissionActionRow
+                                    }
+                                }
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(
+                                                Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                                Uri.parse("package:${context.packageName}")
+                                            )
+                                        )
+                                    }
+                                } else {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                            Uri.parse("package:${context.packageName}")
+                                        )
+                                    )
+                                }
+                            },
+                            tag = "perm_alarm_fullscreen_button"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+
+                        PermissionActionRow(
+                            index = "5a",
+                            title = "Unrestricted Battery",
+                            subtitle = "Keep JARVIS alive when minimized or locked on Android 11+",
+                            granted = batteryUnrestricted,
+                            onGrantClick = {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(
+                                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                            Uri.parse("package:${context.packageName}")
+                                        )
+                                    )
+                                }.onFailure {
+                                    context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                                }
+                            },
+                            tag = "perm_battery_button"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+
+                        PermissionActionRow(
+                            index = "5b",
+                            title = "All Files / Media Storage",
+                            subtitle = "Access Jarvis_Uploads watch folder videos & .txt topic notes",
+                            granted = allFilesStorageGranted,
+                            onGrantClick = {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(
+                                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                                Uri.parse("package:${context.packageName}")
+                                            )
+                                        )
+                                    }.onFailure {
+                                        context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                                    }
+                                } else {
+                                    legacyStorageLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                                }
+                            },
+                            tag = "perm_storage_button"
+                        )
+
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 10.dp))
+
+                        ToggleRow(
+                            title = "Persistent Background Keep-Alive",
+                            subtitle = "Runs ForegroundService + WakeLock so JARVIS stays responsive in background",
+                            checked = config.backgroundKeepAliveEnabled,
+                            onCheckedChange = onToggleBackgroundKeepAlive,
+                            tag = "toggle_background_keep_alive"
+                        )
+                    }
+                }
+
                 // 1. DUAL GEMINI API KEYS
                 item {
                     SettingsSectionCard(
                         title = "Dual Gemini API Keys",
-                        subtitle = "Encrypted via Android Keystore (AES-256-GCM) · Zero Hardcoded Keys"
+                        subtitle = "Supports AIza... & AQ.Ab8... / Bearer tokens · Encrypted in Android Keystore"
                     ) {
                         SecretTextField(
                             value = key1,
                             onValueChange = { key1 = it },
-                            label = "Gemini API Key 1 (Primary)",
+                            label = "Gemini API Key 1 (AIza... or AQ.Ab8...)",
                             visible = showKey1,
                             onToggleVisible = { showKey1 = !showKey1 },
                             tag = "gemini_key_1_input"
@@ -305,11 +499,11 @@ fun SettingsScreen(
                     }
                 }
 
-                // 2. YOUTUBE DATA API v3 & OAUTH 2.0 INTEGRATION
+                // 2. YOUTUBE DATA API v3 & BACKGROUND UPLOADER
                 item {
                     SettingsSectionCard(
                         title = "YouTube Integration",
-                        subtitle = "Auto-SEO Uploader & Proactive Channel Advisor (Test User Gmail Supported)"
+                        subtitle = "Resumable Background Auto-SEO Uploader & Proactive Channel Advisor"
                     ) {
                         if (config.isYouTubeConnected) {
                             Row(
@@ -342,6 +536,48 @@ fun SettingsScreen(
                                         )
                                     }
                                 }
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+
+                        if (uploadProgress.isUploading) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(JarvisCyan.copy(alpha = 0.08f))
+                                    .border(1.dp, JarvisCyan.copy(alpha = 0.25f), RoundedCornerShape(10.dp))
+                                    .padding(12.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = uploadProgress.statusText.ifBlank { "Uploading..." },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "${uploadProgress.percent}%",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = JarvisCyan
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(8.dp))
+                                LinearProgressIndicator(
+                                    progress = { (uploadProgress.percent / 100f).coerceIn(0f, 1f) },
+                                    color = JarvisCyan,
+                                    trackColor = ObsidianBorder,
+                                    strokeCap = StrokeCap.Round,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                )
                             }
                             Spacer(modifier = Modifier.height(12.dp))
                         }
@@ -433,7 +669,7 @@ fun SettingsScreen(
                                 onClick = { showManualCodeDialog = true },
                                 modifier = Modifier.weight(1f)
                             ) {
-                                Text("Enter Auth Code", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
+                                Text("Enter Code", style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                             }
                             TextButton(
                                 onClick = onUploadWatchFolderNow,
@@ -441,7 +677,7 @@ fun SettingsScreen(
                                     .weight(1f)
                                     .testTag("upload_folder_now_button")
                             ) {
-                                Text("Upload Folder", style = MaterialTheme.typography.labelMedium, color = JarvisCyan)
+                                Text("Upload BG", style = MaterialTheme.typography.labelMedium, color = JarvisCyan)
                             }
                             TextButton(
                                 onClick = onRunYouTubeAnalyticsCheck,
@@ -455,11 +691,11 @@ fun SettingsScreen(
                     }
                 }
 
-                // 3. AUTO-REPLY & AUTOMATION TOGGLES
+                // 3. PROACTIVE WHATSAPP ALERTS, AUTO-REPLY & CALL ALARMS
                 item {
                     SettingsSectionCard(
-                        title = "Auto-Reply & Automation",
-                        subtitle = "Zero-Touch Phone Control, Notification Replies & Proactive Calls"
+                        title = "Proactive Alerts & Automation",
+                        subtitle = "WhatsApp Watcher, Hands-Free Auto-Reply & Voice-Call Alarms"
                     ) {
                         ToggleRow(
                             title = "Auto-Reply to Messages",
@@ -470,45 +706,19 @@ fun SettingsScreen(
                         )
                         HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
                         ToggleRow(
+                            title = "Proactive WhatsApp Alerts & Calls",
+                            subtitle = "Sends priority alerts & triggers JARVIS Voice Call for urgent WhatsApp messages",
+                            checked = config.proactiveWhatsAppCallsEnabled,
+                            onCheckedChange = onToggleProactiveWhatsAppCalls,
+                            tag = "toggle_proactive_whatsapp"
+                        )
+                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
+                        ToggleRow(
                             title = "Proactive YouTube Advisor Calls",
                             subtitle = "WorkManager analytics monitor calls you on view spikes or drops",
                             checked = config.proactiveYouTubeCallsEnabled,
                             onCheckedChange = onToggleProactiveYouTubeCalls,
                             tag = "toggle_proactive_yt"
-                        )
-                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
-                        PermissionToggleRow(
-                            title = "Accessibility Phone Control",
-                            subtitle = if (accessibilityEnabled) "Active · Text-Tree reading & direct execution ready" else "Tap to enable ControlService in Android Accessibility",
-                            granted = accessibilityEnabled,
-                            onClick = {
-                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                            },
-                            tag = "toggle_accessibility_control"
-                        )
-                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
-                        PermissionToggleRow(
-                            title = "Notification Access",
-                            subtitle = if (notificationAccessEnabled) "Active · Listening for WhatsApp & SMS replies" else "Tap to grant Notification Listener access",
-                            granted = notificationAccessEnabled,
-                            onClick = {
-                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                            },
-                            tag = "toggle_notification_access"
-                        )
-                        HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
-                        PermissionToggleRow(
-                            title = "Top Floating Control Pill",
-                            subtitle = if (overlayEnabled) "Active · Shows 'JARVIS is using phone' stop pill" else "Tap to allow display over other apps",
-                            granted = overlayEnabled,
-                            onClick = {
-                                val intent = Intent(
-                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                    Uri.parse("package:${context.packageName}")
-                                )
-                                context.startActivity(intent)
-                            },
-                            tag = "toggle_overlay_permission"
                         )
                         HorizontalDivider(color = ObsidianBorder, modifier = Modifier.padding(vertical = 8.dp))
                         Row(
@@ -523,7 +733,7 @@ fun SettingsScreen(
                                     color = TextPrimary
                                 )
                                 Text(
-                                    text = if (exactAlarmEnabled) "Exact lock-screen alarms ready" else "Tap to test full-screen incoming call",
+                                    text = "Lock-screen slide-to-answer voice alarm test",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = TextMuted
                                 )
@@ -548,7 +758,7 @@ fun SettingsScreen(
                 item {
                     SettingsSectionCard(
                         title = "Watch Folder Picker",
-                        subtitle = "Select local folder (e.g. Jarvis_Uploads) for Auto-SEO YouTube uploads"
+                        subtitle = "Select local folder (e.g. Jarvis_Uploads) for background YouTube uploads"
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -564,7 +774,7 @@ fun SettingsScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = if (config.watchFolderUri.isNotBlank()) "SAF folder linked & ready" else "Place video + .txt topic note inside",
+                                    text = if (config.watchFolderUri.isNotBlank()) "Linked · Place video + .txt note in Hindi/Hinglish/English" else "Place video + .txt topic note inside",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = TextMuted
                                 )
@@ -699,7 +909,7 @@ fun SettingsScreen(
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Zero-Token-Wastage · 2-Level Circular Fallback · Local Room Engine",
+                            text = "Universal AIza/Bearer Auth · 2-Level Circular Fallback · Autonomous Control",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextMuted
                         )
@@ -798,6 +1008,87 @@ fun SettingsScreen(
     }
 }
 
+private fun checkAlarmAndFullScreenReady(context: Context): Boolean {
+    val exactOk = JarvisAlarmScheduler.canScheduleExactAlarms(context)
+    val fullScreenOk = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.canUseFullScreenIntent()
+    } else {
+        true
+    }
+    return exactOk && fullScreenOk
+}
+
+private fun checkBatteryUnrestricted(context: Context): Boolean {
+    val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    return pm.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+private fun checkStorageGranted(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        Environment.isExternalStorageManager()
+    } else {
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+}
+
+@Composable
+private fun PermissionActionRow(
+    index: String,
+    title: String,
+    subtitle: String,
+    granted: Boolean,
+    onGrantClick: () -> Unit,
+    tag: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "$index. $title",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextPrimary
+                )
+                if (granted) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = "Granted",
+                        tint = JarvisEmerald,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+        }
+        Spacer(modifier = Modifier.width(10.dp))
+        OutlinedButton(
+            onClick = onGrantClick,
+            shape = RoundedCornerShape(10.dp),
+            modifier = Modifier
+                .height(48.dp)
+                .testTag(tag)
+        ) {
+            Text(
+                text = if (granted) "Active" else "Grant",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (granted) JarvisEmerald else JarvisCyan
+            )
+        }
+    }
+}
+
 @Composable
 private fun SettingsSectionCard(
     title: String,
@@ -883,49 +1174,6 @@ private fun ToggleRow(
             colors = SwitchDefaults.colors(
                 checkedThumbColor = ObsidianBackground,
                 checkedTrackColor = JarvisCyan,
-                uncheckedThumbColor = TextMuted,
-                uncheckedTrackColor = ObsidianSurfaceVariant
-            ),
-            modifier = Modifier.testTag(tag)
-        )
-    }
-}
-
-@Composable
-private fun PermissionToggleRow(
-    title: String,
-    subtitle: String,
-    granted: Boolean,
-    onClick: () -> Unit,
-    tag: String
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(text = title, style = MaterialTheme.typography.bodyMedium, color = TextPrimary)
-                if (granted) {
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Icon(
-                        imageVector = Icons.Rounded.CheckCircle,
-                        contentDescription = "Enabled",
-                        tint = JarvisEmerald,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-            }
-            Text(text = subtitle, style = MaterialTheme.typography.bodySmall, color = TextMuted)
-        }
-        Spacer(modifier = Modifier.width(12.dp))
-        Switch(
-            checked = granted,
-            onCheckedChange = { onClick() },
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = ObsidianBackground,
-                checkedTrackColor = JarvisEmerald,
                 uncheckedThumbColor = TextMuted,
                 uncheckedTrackColor = ObsidianSurfaceVariant
             ),

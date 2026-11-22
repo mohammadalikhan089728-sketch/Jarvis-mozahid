@@ -7,26 +7,25 @@ import com.example.control.DeviceActionHelper
 import com.example.control.ExecutionController
 import com.example.control.FloatingPillManager
 import com.example.data.db.MemoryRepository
-import com.example.youtube.YouTubeUploader
+import com.example.youtube.YouTubeUploadWorker
 import kotlinx.coroutines.delay
 import org.json.JSONObject
 
 /**
- * Central tool-execution orchestrator connecting CircularFallbackEngine with:
- * - Zero-Touch Accessibility ControlService & Top Floating Pill
- * - Device hardware / messaging actions
+ * Central tool-execution orchestrator connecting FallbackApiClient with:
+ * - High-Speed Human-Like Accessibility ControlService & Top Floating Pill
+ * - Device hardware / direct messaging actions
  * - Local Room Memory
- * - JARVIS Voice-Call Alarms
- * - YouTube Auto-SEO Watch Folder Uploader
+ * - JARVIS Lock-Screen Voice-Call Alarms
+ * - Background WorkManager YouTube Auto-SEO Uploader
  */
 class JarvisOrchestrator(
     private val context: Context,
-    private val fallbackEngine: CircularFallbackEngine,
+    private val fallbackApiClient: FallbackApiClient,
     private val voiceEngine: VoiceEngine,
     private val memoryRepository: MemoryRepository,
     private val deviceActions: DeviceActionHelper,
-    private val floatingPill: FloatingPillManager,
-    private val youtubeUploader: YouTubeUploader
+    private val floatingPill: FloatingPillManager
 ) {
     suspend fun handleCommand(
         userText: String,
@@ -41,7 +40,11 @@ class JarvisOrchestrator(
             onStateChange(AssistantState.IDLE)
             val msg = "Stopped, Sir."
             onSubtitleUpdate(msg)
-            return AssistantTurnOutput(msg, alreadySpokenViaLiveAudio = false, usedModelBadge = fallbackEngine.engineState.value.badgeText)
+            return AssistantTurnOutput(
+                spokenText = msg,
+                alreadySpokenViaLiveAudio = false,
+                usedModelBadge = fallbackApiClient.engineState.value.badgeText
+            )
         }
 
         ExecutionController.resetStopFlag()
@@ -50,7 +53,7 @@ class JarvisOrchestrator(
         var usedPhoneControl = false
 
         val output = try {
-            fallbackEngine.processUserTurn(
+            fallbackApiClient.processUserTurn(
                 userText = trimmed,
                 shouldContinue = { ExecutionController.shouldContinue() },
                 executeTool = { name, args ->
@@ -65,7 +68,7 @@ class JarvisOrchestrator(
                             }
                         }
                     }
-                    executeToolByName(name, args, onSubtitleUpdate)
+                    executeToolByName(name, args)
                 },
                 onLiveAudioChunk = { base64Pcm ->
                     onStateChange(AssistantState.SPEAKING)
@@ -88,22 +91,26 @@ class JarvisOrchestrator(
 
     private fun isScreenControlTool(name: String): Boolean {
         return name in setOf(
-            "open_app", "ui_read", "ui_click", "ui_type", "ui_scroll", "ui_back",
+            "go_home", "open_app", "ui_read", "ui_click", "ui_type", "ui_scroll", "ui_back",
             "whatsapp_send", "instagram_dm", "sms_send", "call_contact"
         )
     }
 
     private suspend fun executeToolByName(
         name: String,
-        args: JSONObject,
-        onSubtitleUpdate: (String) -> Unit
+        args: JSONObject
     ): String {
         if (!ExecutionController.shouldContinue()) return "stopped"
         return when (name) {
+            "go_home" -> {
+                val svc = ControlService.instance
+                    ?: return "error: Accessibility ControlService is disabled. Enable it in Settings."
+                svc.goHome()
+            }
             "open_app" -> {
                 val appName = args.optString("app_name", "")
                 val res = deviceActions.openApp(appName)
-                delay(700L)
+                delay(500L)
                 res
             }
             "ui_read" -> {
@@ -114,20 +121,29 @@ class JarvisOrchestrator(
             "ui_click" -> {
                 val svc = ControlService.instance
                     ?: return "error: Accessibility ControlService is disabled."
-                val idx = if (args.has("index") && !args.isNull("index")) args.optInt("index", -1).takeIf { it > 0 } else null
+                val idx = if (args.has("index") && !args.isNull("index")) {
+                    args.optInt("index", -1).takeIf { it > 0 }
+                } else {
+                    null
+                }
                 val txt = args.optString("text", "").takeIf { it.isNotBlank() }
                 val res = svc.uiClick(index = idx, text = txt)
-                delay(450L)
+                delay(280L)
                 res
             }
             "ui_type" -> {
                 val svc = ControlService.instance
                     ?: return "error: Accessibility ControlService is disabled."
-                val idx = if (args.has("index") && !args.isNull("index")) args.optInt("index", -1).takeIf { it > 0 } else null
+                val idx = if (args.has("index") && !args.isNull("index")) {
+                    args.optInt("index", -1).takeIf { it > 0 }
+                } else {
+                    null
+                }
+                val label = args.optString("label", "").takeIf { it.isNotBlank() }
                 val text = args.optString("text", "")
-                val pressSend = args.optBoolean("press_send", false)
-                val res = svc.uiType(index = idx, text = text, pressSend = pressSend)
-                delay(400L)
+                val submit = args.optBoolean("submit", args.optBoolean("press_send", false))
+                val res = svc.uiType(index = idx, label = label, text = text, submit = submit)
+                delay(260L)
                 res
             }
             "ui_scroll" -> {
@@ -135,14 +151,14 @@ class JarvisOrchestrator(
                     ?: return "error: Accessibility ControlService is disabled."
                 val dir = args.optString("direction", "down")
                 val res = svc.uiScroll(dir)
-                delay(450L)
+                delay(260L)
                 res
             }
             "ui_back" -> {
                 val svc = ControlService.instance
                     ?: return "error: Accessibility ControlService is disabled."
                 val res = svc.uiBack()
-                delay(350L)
+                delay(240L)
                 res
             }
             "call_contact" -> {
@@ -200,11 +216,8 @@ class JarvisOrchestrator(
             }
             "youtube_upload_folder" -> {
                 val topic = args.optString("topic", "").takeIf { it.isNotBlank() }
-                val outcome = youtubeUploader.uploadLatestFromWatchFolder(
-                    spokenTopic = topic,
-                    onStatus = { status -> onSubtitleUpdate(status) }
-                )
-                if (outcome.success) "done: ${outcome.message}" else "error: ${outcome.message}"
+                YouTubeUploadWorker.enqueue(context, spokenTopic = topic)
+                "done: background YouTube Auto-SEO upload started with live progress notification"
             }
             else -> "error: unsupported tool '$name'"
         }

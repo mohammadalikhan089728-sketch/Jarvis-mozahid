@@ -9,13 +9,14 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class LiveTurnResult(
     val transcript: String,
     val receivedNativeAudio: Boolean,
     val toolCalls: List<ToolCallRequest>,
-    val isQuotaOrRateLimitError: Boolean = false,
+    val isRetryableError: Boolean = false,
     val errorMessage: String? = null
 )
 
@@ -27,8 +28,11 @@ data class ToolCallRequest(
 
 /**
  * Multimodal Gemini Live WebSocket client (BidiGenerateContent) for `gemini-3.1-flash-live-preview`.
- * Enforces Zero-Token-Wastage: sends single-turn `clientContent` payloads and preserves `resumeHandle`
- * across reconnects so full chat logs are never re-transmitted.
+ * Supports universal API credentials:
+ * - Standard AI Studio keys (`AIza...`): `?key=...` + `x-goog-api-key`
+ * - Cloud / OAuth / Express Bearer tokens (`AQ.Ab8...`, `ya29...`, etc.): `Authorization: Bearer <token>`
+ *   with automatic retry using `?key=` if handshake rejects Bearer.
+ * Enforces Zero-Token-Wastage via single-turn `clientContent` payloads and `resumeHandle` reconnects.
  */
 class GeminiLiveWebSocketClient(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
@@ -71,13 +75,13 @@ class GeminiLiveWebSocketClient(
         onTranscriptDelta = onTextDelta
 
         if (webSocket == null || !isSetupComplete || activeApiKey != apiKey) {
-            val connected = connectAndSetup(apiKey, modelId)
+            val connected = connectWithUniversalAuth(apiKey, modelId)
             if (!connected.first) {
                 return LiveTurnResult(
                     transcript = "",
                     receivedNativeAudio = false,
                     toolCalls = emptyList(),
-                    isQuotaOrRateLimitError = connected.second,
+                    isRetryableError = connected.second,
                     errorMessage = connected.third
                 )
             }
@@ -90,12 +94,11 @@ class GeminiLiveWebSocketClient(
         turnDeferred = deferred
 
         val promptWithMemory = if (!memorySnippet.isNullOrBlank()) {
-            "[Local Memory Match: $memorySnippet]\n$userText"
+            "[Local Memory: $memorySnippet]\n$userText"
         } else {
             userText
         }
 
-        // Single-turn clientContent payload (zero history bloat)
         val clientContentPayload = JSONObject().put(
             "clientContent",
             JSONObject()
@@ -120,20 +123,18 @@ class GeminiLiveWebSocketClient(
                 transcript = "",
                 receivedNativeAudio = false,
                 toolCalls = emptyList(),
-                isQuotaOrRateLimitError = true,
+                isRetryableError = true,
                 errorMessage = "Live WebSocket send failed"
             )
         }
 
-        return withTimeoutOrNull(22_000L) { deferred.await() } ?: run {
-            LiveTurnResult(
-                transcript = turnTranscript.toString().trim(),
-                receivedNativeAudio = receivedAudioInTurn,
-                toolCalls = pendingToolCalls.toList(),
-                isQuotaOrRateLimitError = turnTranscript.isEmpty() && pendingToolCalls.isEmpty(),
-                errorMessage = "Live response timeout"
-            )
-        }
+        return withTimeoutOrNull(22_000L) { deferred.await() } ?: LiveTurnResult(
+            transcript = turnTranscript.toString().trim(),
+            receivedNativeAudio = receivedAudioInTurn,
+            toolCalls = pendingToolCalls.toList(),
+            isRetryableError = turnTranscript.isEmpty() && pendingToolCalls.isEmpty(),
+            errorMessage = "Live response timeout"
+        )
     }
 
     suspend fun sendToolResponses(
@@ -171,7 +172,7 @@ class GeminiLiveWebSocketClient(
                 transcript = "",
                 receivedNativeAudio = false,
                 toolCalls = emptyList(),
-                isQuotaOrRateLimitError = true,
+                isRetryableError = true,
                 errorMessage = "Tool response WebSocket closed"
             )
         }
@@ -180,27 +181,54 @@ class GeminiLiveWebSocketClient(
             transcript = turnTranscript.toString().trim(),
             receivedNativeAudio = receivedAudioInTurn,
             toolCalls = pendingToolCalls.toList(),
-            isQuotaOrRateLimitError = false
+            isRetryableError = false
         )
     }
 
-    private suspend fun connectAndSetup(
-        apiKey: String,
+    private suspend fun connectWithUniversalAuth(
+        credential: String,
         modelId: String
     ): Triple<Boolean, Boolean, String?> {
+        val clean = credential.trim()
+        val isStandardKey = clean.startsWith("AIza")
+        if (isStandardKey) {
+            return connectOnce(clean, modelId, useBearerHeader = false)
+        }
+        // For AQ.Ab8... / OAuth / Express Bearer tokens: try Authorization: Bearer first,
+        // then automatically fall back to ?key= if the endpoint expects a query key.
+        val bearerAttempt = connectOnce(clean, modelId, useBearerHeader = true)
+        if (bearerAttempt.first) return bearerAttempt
+        return connectOnce(clean, modelId, useBearerHeader = false)
+    }
+
+    private suspend fun connectOnce(
+        credential: String,
+        modelId: String,
+        useBearerHeader: Boolean
+    ): Triple<Boolean, Boolean, String?> {
         close()
-        activeApiKey = apiKey
+        activeApiKey = credential
         isSetupComplete = false
         val setup = CompletableDeferred<Boolean>()
         setupDeferred = setup
-        var failureIsQuota = true
         var failureMsg: String? = null
 
-        val url = "wss://generativelanguage.googleapis.com/ws/" +
-            "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        val baseWsUrl =
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
-        val request = Request.Builder().url(url).build()
-        webSocket = httpClient.newWebSocket(request, object : WebSocketListener() {
+        val requestBuilder = if (useBearerHeader) {
+            val bareToken = credential.removePrefix("Bearer ").trim()
+            Request.Builder()
+                .url(baseWsUrl)
+                .addHeader("Authorization", "Bearer $bareToken")
+        } else {
+            val encoded = URLEncoder.encode(credential, "UTF-8")
+            Request.Builder()
+                .url("$baseWsUrl?key=$encoded")
+                .addHeader("x-goog-api-key", credential)
+        }
+
+        webSocket = httpClient.newWebSocket(requestBuilder.build(), object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 val setupObj = JSONObject()
                     .put("model", "models/$modelId")
@@ -243,12 +271,6 @@ class GeminiLiveWebSocketClient(
             }
 
             override fun onClosing(ws: WebSocket, code: Int, reason: String) {
-                val quotaLike = code == 1008 || code == 1011 || code == 1013 ||
-                    reason.contains("quota", ignoreCase = true) ||
-                    reason.contains("RESOURCE_EXHAUSTED", ignoreCase = true) ||
-                    reason.contains("429") ||
-                    reason.contains("not found", ignoreCase = true)
-                failureIsQuota = quotaLike
                 failureMsg = "Live closed ($code): $reason"
                 isSetupComplete = false
                 setup.complete(false)
@@ -257,7 +279,7 @@ class GeminiLiveWebSocketClient(
                         transcript = turnTranscript.toString().trim(),
                         receivedNativeAudio = receivedAudioInTurn,
                         toolCalls = pendingToolCalls.toList(),
-                        isQuotaOrRateLimitError = true,
+                        isRetryableError = true,
                         errorMessage = failureMsg
                     )
                 )
@@ -265,7 +287,6 @@ class GeminiLiveWebSocketClient(
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 val code = response?.code ?: 0
-                failureIsQuota = code == 429 || code == 404 || code == 403 || code == 503 || true
                 failureMsg = t.message ?: "Live WebSocket failure ($code)"
                 isSetupComplete = false
                 setup.complete(false)
@@ -274,7 +295,7 @@ class GeminiLiveWebSocketClient(
                         transcript = "",
                         receivedNativeAudio = false,
                         toolCalls = emptyList(),
-                        isQuotaOrRateLimitError = true,
+                        isRetryableError = true,
                         errorMessage = failureMsg
                     )
                 )
@@ -285,7 +306,7 @@ class GeminiLiveWebSocketClient(
         if (!ok) {
             close()
         }
-        return Triple(ok, failureIsQuota, failureMsg)
+        return Triple(ok, true, failureMsg)
     }
 
     private fun handleServerMessage(raw: String) {

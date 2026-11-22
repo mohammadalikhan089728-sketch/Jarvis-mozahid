@@ -122,12 +122,12 @@ class DeviceActionHelper(private val context: Context) {
         val svc = ControlService.instance ?: return "error: Accessibility ControlService not enabled"
         val searchResult = svc.uiClick(text = "Search")
         if (searchResult == "done") {
-            delay(400L)
-            svc.uiType(text = contact, pressSend = false)
-            delay(700L)
+            delay(300L)
+            svc.uiType(text = contact, submit = false)
+            delay(600L)
             svc.uiClick(text = contact)
-            delay(700L)
-            svc.uiType(text = message, pressSend = true)
+            delay(600L)
+            svc.uiType(text = message, submit = true)
             return "done"
         }
         return "WhatsApp opened; call ui_read to find contact '$contact' and send '$message'"
@@ -142,12 +142,12 @@ class DeviceActionHelper(private val context: Context) {
         delay(700L)
         svc.uiClick(text = "Search")
         delay(400L)
-        svc.uiType(text = username, pressSend = false)
-        delay(800L)
+        svc.uiType(text = username, submit = false)
+        delay(700L)
         val tappedUser = svc.uiClick(text = username)
         if (tappedUser == "done") {
-            delay(700L)
-            svc.uiType(text = message, pressSend = true)
+            delay(600L)
+            svc.uiType(text = message, submit = true)
             return "done"
         }
         return "Instagram opened; use ui_read to select '$username' and send '$message'"

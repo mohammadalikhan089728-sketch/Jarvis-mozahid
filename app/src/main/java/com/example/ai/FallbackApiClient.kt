@@ -13,6 +13,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class SlidingMessage(
@@ -27,22 +28,28 @@ data class AssistantTurnOutput(
 )
 
 /**
- * 2-Level Circular Fallback Engine (Zero Rate-Limit Errors):
- * - Level 1: Rotates silently across all 6 models in ModelRingConfig.MODEL_RING.
- * - Level 2: When all 6 models exhaust quota on API Key 1, silently switches to API Key 2
- *   and restarts from Model 1, looping infinitely.
- * - Zero-Token-Wastage: Only last 4 messages on REST calls; single-turn payloads on Live WebSocket;
- *   only top matching Room memory snippet injected per query.
+ * Production-grade Universal Fallback API Client & 2-Level Circular Fallback Engine:
+ * - Universal Key Support:
+ *   * `AIza...` keys -> sent via `?key=...` and `x-goog-api-key`
+ *   * `AQ.Ab8...` / OAuth / Express Bearer tokens -> sent via `Authorization: Bearer <token>`,
+ *     with automatic retry using `?key=...` if rejected.
+ * - 2-Level Circular Rotation:
+ *   * Level 1: Silently rotates across the 6-model ring (`gemini-3.1-flash-live-preview` ->
+ *     `gemini-3.8-flash` -> `gemini-3.6-flash` -> `gemini-3.5-flash-lite` ->
+ *     `gemini-decision-1` -> `gemini-4-hydrogen`) on 429, RESOURCE_EXHAUSTED, quota, auth, or network errors.
+ *   * Level 2: Switches seamlessly between API Key 1 and API Key 2, looping infinitely without errors.
+ * - Zero-Token-Wastage: Single-turn payloads on Live WebSocket, max 4-message sliding window on REST,
+ *   and single top matching Room memory snippet injected per query.
  */
-class CircularFallbackEngine(
+class FallbackApiClient(
     private val vault: SecureVault,
     private val memoryRepository: MemoryRepository,
     private val liveClient: GeminiLiveWebSocketClient = GeminiLiveWebSocketClient()
 ) {
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(28, TimeUnit.SECONDS)
+        .writeTimeout(28, TimeUnit.SECONDS)
         .build()
 
     @Volatile
@@ -62,11 +69,7 @@ class CircularFallbackEngine(
 
     private fun buildEngineState(): ActiveEngineState {
         val keys = vault.getAvailableGeminiKeys()
-        val safeKeyNum = if (keys.isEmpty()) {
-            1
-        } else {
-            keys[currentKeyListIndex % keys.size].first
-        }
+        val safeKeyNum = if (keys.isEmpty()) 1 else keys[currentKeyListIndex % keys.size].first
         return ActiveEngineState(
             modelSlot = ModelRingConfig.MODEL_RING[currentModelIndex],
             activeKeyNumber = safeKeyNum,
@@ -97,7 +100,7 @@ class CircularFallbackEngine(
     }
 
     /**
-     * Executes a full user voice/text turn with autonomous multi-step tool loop and silent fallback.
+     * Executes a full voice/text command turn with autonomous multi-step tool loop and silent rotation.
      */
     suspend fun processUserTurn(
         userText: String,
@@ -109,7 +112,7 @@ class CircularFallbackEngine(
         val keys = vault.getAvailableGeminiKeys()
         if (keys.isEmpty()) {
             return@withContext AssistantTurnOutput(
-                spokenText = "Sir, please configure at least one Gemini API Key in Settings to activate my neural link.",
+                spokenText = "Sir, please add your Gemini API Key in Settings to activate JARVIS.",
                 alreadySpokenViaLiveAudio = false,
                 usedModelBadge = "No API Key"
             )
@@ -118,6 +121,7 @@ class CircularFallbackEngine(
         val topMemory = memoryRepository.findTopMatchingSnippet(userText)
         appendSlidingMessage("user", userText)
 
+        // Allow two full sweeps across all models * all keys so transient rate limits never interrupt
         val maxRotationAttempts = ModelRingConfig.MODEL_RING.size * keys.size
         var attempts = 0
 
@@ -133,8 +137,8 @@ class CircularFallbackEngine(
                 hasConfiguredKeys = true
             )
 
-            if (slot.isLiveWebSocket) {
-                val liveResult = runLiveLoop(
+            val result = if (slot.isLiveWebSocket) {
+                runLiveLoop(
                     apiKey = apiKey,
                     slot = slot,
                     userText = userText,
@@ -144,15 +148,8 @@ class CircularFallbackEngine(
                     onLiveAudioChunk = onLiveAudioChunk,
                     onSubtitleUpdate = onSubtitleUpdate
                 )
-                if (liveResult != null) {
-                    appendSlidingMessage("model", liveResult.spokenText)
-                    return@withContext liveResult
-                }
-                // Silently rotate to next model (3.8-flash, etc.)
-                rotateNext(activeKeys.size)
-                attempts++
             } else {
-                val restResult = runRestLoop(
+                runRestLoop(
                     apiKey = apiKey,
                     slot = slot,
                     keyNum = keyNum,
@@ -161,17 +158,20 @@ class CircularFallbackEngine(
                     executeTool = executeTool,
                     onSubtitleUpdate = onSubtitleUpdate
                 )
-                if (restResult != null) {
-                    appendSlidingMessage("model", restResult.spokenText)
-                    return@withContext restResult
-                }
-                rotateNext(activeKeys.size)
-                attempts++
             }
+
+            if (result != null) {
+                appendSlidingMessage("model", result.spokenText)
+                return@withContext result
+            }
+
+            // Silently rotate to next model (and next key after Model 6)
+            rotateNext(activeKeys.size)
+            attempts++
         }
 
         AssistantTurnOutput(
-            spokenText = "Sir, all configured models are currently busy. Please verify your API keys in Settings.",
+            spokenText = "Sir, I rotated across all configured models and keys, please verify your API key permissions in Settings.",
             alreadySpokenViaLiveAudio = false,
             usedModelBadge = _engineState.value.badgeText
         )
@@ -196,7 +196,7 @@ class CircularFallbackEngine(
             onTextDelta = onSubtitleUpdate
         )
 
-        if (result.isQuotaOrRateLimitError && result.transcript.isEmpty() && result.toolCalls.isEmpty()) {
+        if (result.isRetryableError && result.transcript.isEmpty() && result.toolCalls.isEmpty()) {
             return null
         }
 
@@ -211,7 +211,7 @@ class CircularFallbackEngine(
             }
             if (!shouldContinue()) {
                 return AssistantTurnOutput(
-                    spokenText = "Stopped as requested, Sir.",
+                    spokenText = "Stopped, Sir.",
                     alreadySpokenViaLiveAudio = false,
                     usedModelBadge = _engineState.value.badgeText
                 )
@@ -221,7 +221,7 @@ class CircularFallbackEngine(
                 onAudioBase64 = onLiveAudioChunk,
                 onTextDelta = onSubtitleUpdate
             )
-            if (result.isQuotaOrRateLimitError && result.transcript.isEmpty() && result.toolCalls.isEmpty()) {
+            if (result.isRetryableError && result.transcript.isEmpty() && result.toolCalls.isEmpty()) {
                 return null
             }
         }
@@ -251,7 +251,7 @@ class CircularFallbackEngine(
         val windowCopy = synchronized(slidingWindow) { slidingWindow.toList() }
         windowCopy.forEachIndexed { idx, msg ->
             val contentText = if (idx == windowCopy.lastIndex && msg.role == "user" && !topMemory.isNullOrBlank()) {
-                "[Local Memory Match: $topMemory]\n${msg.text}"
+                "[Local Memory: $topMemory]\n${msg.text}"
             } else {
                 msg.text
             }
@@ -264,19 +264,17 @@ class CircularFallbackEngine(
 
         var step = 0
         while (step <= MAX_TOOL_STEPS && shouldContinue()) {
-            val response = executeRestGenerateContent(
-                apiKey = apiKey,
+            val response = executeRestWithUniversalAuth(
+                credential = apiKey,
                 modelId = slot.modelId,
                 contents = contents,
                 includeTools = true
             )
 
-            if (response.shouldRotate) return null
-            if (response.error != null) return null
+            if (response.shouldRotate || response.error != null) return null
 
             val toolCalls = response.toolCalls
             if (toolCalls.isNotEmpty() && step < MAX_TOOL_STEPS) {
-                // Append model functionCall turn
                 val modelParts = JSONArray()
                 for (tc in toolCalls) {
                     modelParts.put(
@@ -290,7 +288,6 @@ class CircularFallbackEngine(
                 }
                 contents.put(JSONObject().put("role", "model").put("parts", modelParts))
 
-                // Execute tools immediately and append functionResponse turn
                 val userToolParts = JSONArray()
                 for (tc in toolCalls) {
                     if (!shouldContinue()) {
@@ -328,15 +325,15 @@ class CircularFallbackEngine(
         }
 
         return AssistantTurnOutput(
-            spokenText = "Task loop finished, Sir.",
+            spokenText = "Task completed, Sir.",
             alreadySpokenViaLiveAudio = false,
             usedModelBadge = "${slot.badgeLabel} · K$keyNum"
         )
     }
 
     /**
-     * Lightweight single-shot completion using the exact same silent circular fallback ring
-     * (used by Notification Auto-Reply and YouTube Auto-SEO Generator).
+     * Compact single-shot generation using the exact same universal key auth & 2-level circular fallback ring
+     * (used by NotificationWatchService auto-reply, YouTube Auto-SEO generator, and proactive briefings).
      */
     suspend fun generateCompactText(
         prompt: String,
@@ -354,7 +351,7 @@ class CircularFallbackEngine(
         var localKeyIdx = currentKeyListIndex % keys.size
 
         while (attempts < maxAttempts) {
-            val apiKey = keys[localKeyIdx].second
+            val credential = keys[localKeyIdx].second
             val modelId = restModels[localModelIdx].modelId
 
             val contents = JSONArray().put(
@@ -363,8 +360,8 @@ class CircularFallbackEngine(
                     .put("parts", JSONArray().put(JSONObject().put("text", prompt)))
             )
 
-            val res = executeRestGenerateContent(
-                apiKey = apiKey,
+            val res = executeRestWithUniversalAuth(
+                credential = credential,
                 modelId = modelId,
                 contents = contents,
                 includeTools = false,
@@ -389,32 +386,95 @@ class CircularFallbackEngine(
         val text: String = "",
         val toolCalls: List<ToolCallRequest> = emptyList(),
         val shouldRotate: Boolean = false,
+        val httpCode: Int = 0,
         val error: String? = null
     )
 
-    private fun executeRestGenerateContent(
-        apiKey: String,
+    /**
+     * Universal Key Auth for REST:
+     * - `AIza...` -> `?key=...` + `x-goog-api-key`
+     * - `AQ.Ab8...` / OAuth / Bearer token -> `Authorization: Bearer <token>`,
+     *   retrying immediately with `?key=` + `x-goog-api-key` on 401/403/400.
+     */
+    private fun executeRestWithUniversalAuth(
+        credential: String,
         modelId: String,
         contents: JSONArray,
         includeTools: Boolean,
         systemInstructionOverride: String? = null,
         jsonMimeType: Boolean = false
     ): RestCallResult {
-        val url = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent?key=$apiKey"
+        val clean = credential.trim()
+        val isStandardAiStudioKey = clean.startsWith("AIza")
+
+        if (isStandardAiStudioKey) {
+            return executeRestSingleAttempt(
+                credential = clean,
+                useBearer = false,
+                modelId = modelId,
+                contents = contents,
+                includeTools = includeTools,
+                systemInstructionOverride = systemInstructionOverride,
+                jsonMimeType = jsonMimeType
+            )
+        }
+
+        // First try Authorization: Bearer <token> for AQ.Ab8... / OAuth / Cloud tokens
+        val bearerRes = executeRestSingleAttempt(
+            credential = clean,
+            useBearer = true,
+            modelId = modelId,
+            contents = contents,
+            includeTools = includeTools,
+            systemInstructionOverride = systemInstructionOverride,
+            jsonMimeType = jsonMimeType
+        )
+        if (bearerRes.error == null && !bearerRes.shouldRotate) {
+            return bearerRes
+        }
+
+        // Retry with ?key=<token> & x-goog-api-key if Bearer was rejected with auth/bad-request error
+        if (bearerRes.httpCode in setOf(400, 401, 403)) {
+            return executeRestSingleAttempt(
+                credential = clean,
+                useBearer = false,
+                modelId = modelId,
+                contents = contents,
+                includeTools = includeTools,
+                systemInstructionOverride = systemInstructionOverride,
+                jsonMimeType = jsonMimeType
+            )
+        }
+
+        return bearerRes
+    }
+
+    private fun executeRestSingleAttempt(
+        credential: String,
+        useBearer: Boolean,
+        modelId: String,
+        contents: JSONArray,
+        includeTools: Boolean,
+        systemInstructionOverride: String?,
+        jsonMimeType: Boolean
+    ): RestCallResult {
+        val baseUrl = "https://generativelanguage.googleapis.com/v1beta/models/$modelId:generateContent"
         val bodyJson = JSONObject()
             .put(
                 "system_instruction",
                 JSONObject().put(
                     "parts",
-                    JSONArray().put(JSONObject().put("text", systemInstructionOverride ?: ModelRingConfig.SYSTEM_PROMPT))
+                    JSONArray().put(
+                        JSONObject().put("text", systemInstructionOverride ?: ModelRingConfig.SYSTEM_PROMPT)
+                    )
                 )
             )
             .put("contents", contents)
             .put(
                 "generationConfig",
                 JSONObject()
-                    .put("temperature", 0.4)
-                    .put("maxOutputTokens", 350)
+                    .put("temperature", 0.35)
+                    .put("maxOutputTokens", 380)
                     .apply {
                         if (jsonMimeType) put("responseMimeType", "application/json")
                     }
@@ -424,31 +484,43 @@ class CircularFallbackEngine(
             bodyJson.put("tools", ModelRingConfig.buildToolDeclarationsJson())
         }
 
-        val request = Request.Builder()
-            .url(url)
-            .post(bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE))
-            .build()
+        val requestBody = bodyJson.toString().toRequestBody(JSON_MEDIA_TYPE)
+        val requestBuilder = if (useBearer) {
+            val bareToken = credential.removePrefix("Bearer ").trim()
+            Request.Builder()
+                .url(baseUrl)
+                .addHeader("Authorization", "Bearer $bareToken")
+                .post(requestBody)
+        } else {
+            val encoded = URLEncoder.encode(credential, "UTF-8")
+            Request.Builder()
+                .url("$baseUrl?key=$encoded")
+                .addHeader("x-goog-api-key", credential)
+                .post(requestBody)
+        }
 
         return try {
-            httpClient.newCall(request).execute().use { resp ->
+            httpClient.newCall(requestBuilder.build()).execute().use { resp ->
                 val raw = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) {
-                    val isQuotaOrUnavailable = resp.code == 429 ||
-                        resp.code == 404 ||
-                        resp.code == 503 ||
+                    val shouldRotate = resp.code in setOf(401, 403, 404, 429, 500, 503) ||
                         raw.contains("RESOURCE_EXHAUSTED", ignoreCase = true) ||
                         raw.contains("quota", ignoreCase = true) ||
                         raw.contains("rate", ignoreCase = true) ||
-                        raw.contains("not found", ignoreCase = true)
+                        raw.contains("not found", ignoreCase = true) ||
+                        raw.contains("API_KEY_INVALID", ignoreCase = true)
                     return RestCallResult(
-                        shouldRotate = isQuotaOrUnavailable,
+                        shouldRotate = shouldRotate,
+                        httpCode = resp.code,
                         error = "HTTP ${resp.code}"
                     )
                 }
 
                 val root = JSONObject(raw)
-                val candidates = root.optJSONArray("candidates") ?: return RestCallResult(error = "Empty candidates")
-                val first = candidates.optJSONObject(0) ?: return RestCallResult(error = "No candidate")
+                val candidates = root.optJSONArray("candidates")
+                    ?: return RestCallResult(shouldRotate = true, httpCode = resp.code, error = "Empty candidates")
+                val first = candidates.optJSONObject(0)
+                    ?: return RestCallResult(shouldRotate = true, httpCode = resp.code, error = "No candidate")
                 val parts = first.optJSONObject("content")?.optJSONArray("parts") ?: JSONArray()
 
                 val textBuilder = StringBuilder()
@@ -469,7 +541,7 @@ class CircularFallbackEngine(
                         )
                     }
                 }
-                RestCallResult(text = textBuilder.toString(), toolCalls = calls)
+                RestCallResult(text = textBuilder.toString(), toolCalls = calls, httpCode = resp.code)
             }
         } catch (e: Exception) {
             RestCallResult(shouldRotate = true, error = e.message)
@@ -483,7 +555,7 @@ class CircularFallbackEngine(
 
     companion object {
         private const val MAX_SLIDING_WINDOW = 4
-        private const val MAX_TOOL_STEPS = 12
+        private const val MAX_TOOL_STEPS = 20
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }

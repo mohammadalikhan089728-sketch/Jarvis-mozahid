@@ -25,7 +25,9 @@ data class JarvisConfigSnapshot(
     val youtubeChannelStats: String = "",
     val isYouTubeConnected: Boolean = false,
     val autoReplyEnabled: Boolean = false,
+    val proactiveWhatsAppCallsEnabled: Boolean = true,
     val proactiveYouTubeCallsEnabled: Boolean = false,
+    val backgroundKeepAliveEnabled: Boolean = false,
     val watchFolderUri: String = "",
     val watchFolderName: String = "Jarvis_Uploads (Not Selected)"
 )
@@ -179,9 +181,21 @@ class SecureVault(context: Context) {
         refresh()
     }
 
+    fun isProactiveWhatsAppCallsEnabled(): Boolean = prefs.getBoolean(KEY_PROACTIVE_WA_CALLS, true)
+    fun setProactiveWhatsAppCallsEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_PROACTIVE_WA_CALLS, enabled).apply()
+        refresh()
+    }
+
     fun isProactiveYouTubeCallsEnabled(): Boolean = prefs.getBoolean(KEY_PROACTIVE_YT_CALLS, false)
     fun setProactiveYouTubeCallsEnabled(enabled: Boolean) {
         prefs.edit().putBoolean(KEY_PROACTIVE_YT_CALLS, enabled).apply()
+        refresh()
+    }
+
+    fun isBackgroundKeepAliveEnabled(): Boolean = prefs.getBoolean(KEY_KEEP_ALIVE, false)
+    fun setBackgroundKeepAliveEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_KEEP_ALIVE, enabled).apply()
         refresh()
     }
 
@@ -221,7 +235,9 @@ class SecureVault(context: Context) {
             youtubeChannelStats = prefs.getString(KEY_YT_CHANNEL_STATS, "") ?: "",
             isYouTubeConnected = channelName.isNotBlank() && accessToken.isNotBlank(),
             autoReplyEnabled = isAutoReplyEnabled(),
+            proactiveWhatsAppCallsEnabled = isProactiveWhatsAppCallsEnabled(),
             proactiveYouTubeCallsEnabled = isProactiveYouTubeCallsEnabled(),
+            backgroundKeepAliveEnabled = isBackgroundKeepAliveEnabled(),
             watchFolderUri = getWatchFolderUri(),
             watchFolderName = getWatchFolderName()
         )
@@ -249,7 +265,9 @@ class SecureVault(context: Context) {
         private const val KEY_YT_CHANNEL_STATS = "youtube_channel_stats"
         private const val KEY_PKCE_VERIFIER = "enc_pkce_verifier"
         private const val KEY_AUTO_REPLY = "auto_reply_enabled"
+        private const val KEY_PROACTIVE_WA_CALLS = "proactive_wa_calls_enabled"
         private const val KEY_PROACTIVE_YT_CALLS = "proactive_yt_calls_enabled"
+        private const val KEY_KEEP_ALIVE = "background_keep_alive_enabled"
         private const val KEY_WATCH_FOLDER_URI = "watch_folder_uri"
         private const val KEY_WATCH_FOLDER_NAME = "watch_folder_name"
         private const val KEY_LAST_ALERTED_VIDEO_ID = "last_alerted_video_id"

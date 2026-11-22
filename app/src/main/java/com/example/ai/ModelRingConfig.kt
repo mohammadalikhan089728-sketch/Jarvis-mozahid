@@ -52,21 +52,26 @@ object ModelRingConfig {
     )
 
     const val SYSTEM_PROMPT =
-        "You are JARVIS, an intelligent, loyal Android voice assistant created by Mozahid. " +
+        "You are JARVIS, an autonomous, high-speed Android AI assistant created by Mozahid. " +
             "Address your creator respectfully as 'Sir' or 'Mozahid Sir'. " +
-            "Respond in the user's language (Hindi, Hinglish, or English) in 1 to 3 concise sentences. " +
-            "Act immediately using tools without narrating steps. " +
-            "Use ui_read to inspect screens as numbered text lists and ui_click/ui_type/ui_scroll " +
-            "to complete multi-step tasks autonomously until finished. " +
-            "Never pretend an action succeeded unless the tool returns 'done'."
+            "Reply in the user's language (Hindi, Hinglish, or English) in 1 to 2 concise sentences. " +
+            "Never narrate steps—immediately execute multi-step actions in a loop using " +
+            "go_home, ui_read, ui_click, ui_type, and ui_scroll until the task is completely done. " +
+            "Keep token usage minimal."
 
     /**
-     * Builds compact Gemini Function Declarations JSON for zero-token-wastage tool calling.
+     * Compact Gemini Function Declarations JSON for high-speed autonomous phone control,
+     * local memory, voice-call alarms, and background YouTube uploads.
      */
     fun buildToolDeclarationsJson(): JSONArray {
         val declarations = JSONArray()
 
-        fun addTool(name: String, desc: String, props: Map<String, Pair<String, String>>, required: List<String> = emptyList()) {
+        fun addTool(
+            name: String,
+            desc: String,
+            props: Map<String, Pair<String, String>>,
+            required: List<String> = emptyList()
+        ) {
             val propertiesObj = JSONObject()
             props.forEach { (k, pair) ->
                 propertiesObj.put(
@@ -91,6 +96,11 @@ object ModelRingConfig {
         }
 
         addTool(
+            "go_home",
+            "Press Android Home button immediately and return the home screen UI tree.",
+            emptyMap()
+        )
+        addTool(
             "open_app",
             "Open an installed Android app by name or package.",
             mapOf("app_name" to ("STRING" to "App name e.g. WhatsApp, YouTube, Instagram, Chrome")),
@@ -98,31 +108,32 @@ object ModelRingConfig {
         )
         addTool(
             "ui_read",
-            "Read current screen UI as a compact numbered text tree.",
+            "Extract current active screen as a compact numbered text tree with coordinates.",
             emptyMap()
         )
         addTool(
             "ui_click",
-            "Click a UI element directly by index from ui_read or visible text (including Send buttons).",
+            "Click a UI element directly by index from ui_read or visible label (Send, Like, Comment, Call, app icons).",
             mapOf(
                 "index" to ("INTEGER" to "Element index from ui_read"),
-                "text" to ("STRING" to "Visible label or button text to click")
+                "text" to ("STRING" to "Visible label, icon description, or button text to click")
             )
         )
         addTool(
             "ui_type",
-            "Type text into an input field by index or focused field, optionally tapping Send.",
+            "Focus input field by index or label, type text instantly, and optionally press IME Search/Send.",
             mapOf(
                 "index" to ("INTEGER" to "Optional element index from ui_read"),
+                "label" to ("STRING" to "Optional input field hint/label if index omitted"),
                 "text" to ("STRING" to "Text to type"),
-                "press_send" to ("BOOLEAN" to "If true, click Send immediately after typing")
+                "submit" to ("BOOLEAN" to "If true, immediately trigger IME Search/Send or tap Send")
             ),
             listOf("text")
         )
         addTool(
             "ui_scroll",
-            "Scroll the current screen up or down.",
-            mapOf("direction" to ("STRING" to "up or down")),
+            "Smooth human-like swipe gesture in any direction (up, down, left, right).",
+            mapOf("direction" to ("STRING" to "up, down, left, or right")),
             listOf("direction")
         )
         addTool(
@@ -167,7 +178,7 @@ object ModelRingConfig {
             "device_control",
             "Control device hardware: volume_up, volume_down, mute, unmute, flashlight_on, flashlight_off, battery.",
             mapOf(
-                "action" to ("STRING" to "One of: volume_up, volume_down, mute, unmute, flashlight_on, flashlight_off, battery")
+                "action" to ("STRING" to "volume_up, volume_down, mute, unmute, flashlight_on, flashlight_off, or battery")
             ),
             listOf("action")
         )
@@ -182,10 +193,10 @@ object ModelRingConfig {
         )
         addTool(
             "set_jarvis_call_alarm",
-            "Schedule a JARVIS full-screen incoming voice-call alarm that rings even when locked and speaks the custom reason.",
+            "Schedule a JARVIS full-screen incoming voice-call alarm that rings over the lock screen and speaks the custom reason.",
             mapOf(
                 "delay_minutes" to ("INTEGER" to "Minutes from now until alarm rings"),
-                "reason" to ("STRING" to "Custom purpose e.g. Study time, Padhne ka time")
+                "reason" to ("STRING" to "Custom purpose e.g. Padhne ka time, Study time")
             ),
             listOf("delay_minutes", "reason")
         )
@@ -203,8 +214,8 @@ object ModelRingConfig {
         )
         addTool(
             "youtube_upload_folder",
-            "Auto-generate viral SEO metadata and upload the newest video from the Jarvis_Uploads watch folder to YouTube.",
-            mapOf("topic" to ("STRING" to "Optional spoken topic if no .txt note exists")),
+            "Start background Auto-SEO YouTube upload of the newest video from the Jarvis_Uploads watch folder.",
+            mapOf("topic" to ("STRING" to "Optional spoken topic in Hindi, Hinglish, or English")),
             emptyList()
         )
 

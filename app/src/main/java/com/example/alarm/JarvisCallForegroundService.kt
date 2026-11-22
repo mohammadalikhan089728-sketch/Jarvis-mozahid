@@ -101,10 +101,10 @@ class JarvisCallForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val subtitle = if (callType == JarvisAlarmScheduler.CALL_TYPE_YOUTUBE_ADVISOR) {
-            "YouTube Channel Briefing"
-        } else {
-            "Reminder: $reason"
+        val subtitle = when (callType) {
+            JarvisAlarmScheduler.CALL_TYPE_YOUTUBE_ADVISOR -> "YouTube Channel Briefing"
+            JarvisAlarmScheduler.CALL_TYPE_WHATSAPP_ALERT -> "Urgent WhatsApp Alert"
+            else -> "Reminder: $reason"
         }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
